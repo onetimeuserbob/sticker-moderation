@@ -261,6 +261,20 @@ class MediaGroupBuffer:
 
 
 @dataclass
+class ApplicationBuffer:
+    """Per-chat buffer that groups all messages of a single application
+    together, regardless of whether they share a media_group_id.
+
+    @sticker_bot's applications come as ≥2 separate messages: a media
+    group of 2 photos (logo + cover) and a separate text message with
+    the description and pack link. Without buffering across messages we
+    review the photos and the text as two independent applications."""
+    messages: list[Message] = field(default_factory=list)
+    seen_ids: set[int] = field(default_factory=set)
+    task: asyncio.Task | None = None
+
+
+@dataclass
 class PendingRuleInput:
     """User typed /addrule with no args — waiting for the rule text in the next message."""
     user_id: int
@@ -283,6 +297,8 @@ class ReviewBot:
         self.claude = Anthropic(api_key=model_cfg.anthropic_key)
 
         self.media_groups: dict[str, MediaGroupBuffer] = {}
+        self.app_buffers: dict[int, ApplicationBuffer] = {}  # by chat_id
+        self.app_debounce_s: float = 3.0
         self.pending_rule_input: dict[int, PendingRuleInput] = {}  # by user_id
         # Track verdict messages we posted so we can recognize replies as
         # disagreement signals: bot_message_id -> {original_msg_id, pack_url, verdict, reasoning}
@@ -665,37 +681,49 @@ class ReviewBot:
         if not (is_private or from_source or addressed_to_us):
             return
 
-        # Media group: buffer and debounce so we collect all photos.
-        if msg.media_group_id:
-            await self._buffer_media_group(msg, ctx)
+        # Only buffer messages that look like part of an application.
+        # Anything else (random chit-chat in DM, unrelated text in group)
+        # is silently ignored to avoid wasting Claude calls on it.
+        looks_like_app_part = bool(
+            msg.photo
+            or msg.media_group_id
+            or find_pack_url(message_text_or_caption(msg))
+            or from_source
+        )
+        if not looks_like_app_part:
             return
 
-        # Single message — review immediately if it looks like an application.
-        if msg.photo or find_pack_url(message_text_or_caption(msg)):
-            await self._review_application(ctx, [msg])
+        await self._buffer_application(msg, ctx)
 
-    # ---------- media group debouncer ----------
+    # ---------- per-chat application debouncer ----------
 
-    async def _buffer_media_group(self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        gid = msg.media_group_id
-        buf = self.media_groups.get(gid)
+    async def _buffer_application(self, msg: Message, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Buffer all application-shaped messages from a single chat that
+        arrive within `app_debounce_s` of each other, then review the
+        whole batch as ONE application. This is what stitches the photo
+        media group together with the separate text-with-pack-link
+        message that @sticker_bot sends a moment later."""
+        chat_id = msg.chat_id
+        buf = self.app_buffers.get(chat_id)
         if buf is None:
-            buf = MediaGroupBuffer(chat_id=msg.chat_id)
-            self.media_groups[gid] = buf
+            buf = ApplicationBuffer()
+            self.app_buffers[chat_id] = buf
+        if msg.message_id in buf.seen_ids:
+            return  # already buffered (defensive against duplicate updates)
+        buf.seen_ids.add(msg.message_id)
         buf.messages.append(msg)
         if buf.task and not buf.task.done():
             buf.task.cancel()
-        buf.task = asyncio.create_task(self._fire_media_group(gid, ctx))
+        buf.task = asyncio.create_task(self._fire_application(chat_id, ctx))
 
-    async def _fire_media_group(self, gid: str, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _fire_application(self, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try:
-            await asyncio.sleep(self.bot_cfg.media_group_debounce_s)
+            await asyncio.sleep(self.app_debounce_s)
         except asyncio.CancelledError:
             return
-        buf = self.media_groups.pop(gid, None)
+        buf = self.app_buffers.pop(chat_id, None)
         if not buf or not buf.messages:
             return
-        # Sort by message_id so the order is stable (logo usually first).
         msgs = sorted(buf.messages, key=lambda m: m.message_id)
         await self._review_application(ctx, msgs)
 
@@ -714,12 +742,15 @@ class ReviewBot:
         pack_url = find_pack_url(full_text) or ""
 
         # Post a placeholder so the user knows we're working. We'll
-        # delete it right before posting the real verdict.
+        # delete it right before posting the real verdict. do_quote=True
+        # makes Telegram show the visible "↳ replying to" indicator even
+        # in private chats, so it's obvious which application this is for.
         checking_msg: Message | None = None
         try:
             checking_msg = await anchor.reply_text(
                 "🔍 Checking application…",
                 disable_notification=True,
+                do_quote=True,
             )
         except Exception as e:  # noqa: BLE001
             log.warning("could not send 'Checking…' placeholder: %s", e)
@@ -811,6 +842,7 @@ class ReviewBot:
             verdict_text,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
+            do_quote=True,
         )
 
         # Index this verdict so a reply can be recognized as a correction.
