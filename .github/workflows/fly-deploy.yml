@@ -17,10 +17,8 @@ jobs:
   deploy:
     name: Build & deploy to fly.io
     runs-on: ubuntu-latest
-    # Skip deploys if the only changes are docs/CI yaml. Saves ~2min per
-    # README tweak. Code/Dockerfile/fly.toml changes always deploy.
-    if: |
-      !contains(github.event.head_commit.message, '[skip deploy]')
+    # Skip deploys when the commit message contains "[skip deploy]".
+    if: ${{ !contains(github.event.head_commit.message, '[skip deploy]') }}
     steps:
       - uses: actions/checkout@v4
 
