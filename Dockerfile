@@ -27,6 +27,9 @@ COPY build_review.py ./
 RUN mkdir -p /data
 ENV RULES_STORE_PATH=/data/rules_store.json \
     ALLOWLIST_PATH=/data/allowed_chats.json \
-    TG_CACHE_DIR=/data/tg_cache
+    TG_CACHE_DIR=/data/tg_cache \
+    PORT=8080
+
+EXPOSE 8080
 
 CMD ["python", "review_bot.py"]

@@ -175,10 +175,13 @@ class RulesStore:
 
     def rules_summary(self, source_bot: str = "sticker_bot") -> str:
         """Concise human summary for the /rules command."""
+        # Escape underscores so usernames like @sticker_bot don't render
+        # as italics under Telegram's legacy Markdown parser.
+        safe_source = (source_bot or "").replace("_", r"\_")
         base = (
             "*Sticker Pad — moderation policy (summary)*\n\n"
             "I review applications posted by @"
-            + source_bot
+            + safe_source
             + " and suggest ✅ APPROVE or ❌ REJECT with a one-line reason. "
             "Default is GREEN — I only carve out high-risk cases.\n\n"
             "*🔴 RED (auto-reject)*\n"

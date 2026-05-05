@@ -13,7 +13,8 @@ primary_region = 'ams'
   strategy = 'immediate'
 
 [env]
-  PYTHONUNBUFFERED = '1'
+  PYTHONUNBUFFERED = "1"
+  PORT = "8080"
 
 [[mounts]]
   source = 'review_bot_data'
@@ -32,4 +33,16 @@ primary_region = 'ams'
   memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 256
+
+# The bot itself uses Telegram long-polling (outbound only). We also
+# bind a tiny health-check HTTP server on $PORT so fly's deploy probes
+# get a 200, and the machine stays running 24/7 (no auto-stop).
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[deploy]
+  strategy = "immediate"
