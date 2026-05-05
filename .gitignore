@@ -1,0 +1,39 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Persisted bot state (lives on the fly.io volume)
+.rules_store.json
+.allowed_chats.json
+.tg_cache/
+
+# Pipeline working artifacts (large, may contain real pack data)
+.pack_cache*.jsonl
+.dryrun_cache.jsonl
+*.csv
+*_review.html
+run.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Fly
+fly.toml.bak
+.fly/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

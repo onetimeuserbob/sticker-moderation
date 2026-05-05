@@ -1,0 +1,31 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.py[cod]
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+.env
+.env.*
+
+# state files (always created fresh from /data volume)
+.rules_store.json
+.allowed_chats.json
+.tg_cache/
+
+# pipeline working artifacts (large, never needed at runtime)
+.pack_cache*.jsonl
+.dryrun_cache.jsonl
+*.csv
+*_review.html
+run.log
+
+# fly metadata
+fly.toml
+
+# docs / dev only
+README.md
+.DS_Store
