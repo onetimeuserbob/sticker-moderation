@@ -1164,6 +1164,47 @@ Output ONLY a JSON object:
 
 # ---------- helpers ----------
 
+def _start_health_server(port: int) -> None:
+    """Tiny stdlib HTTP server in a daemon thread for deploy health checks.
+
+    fly.io's "Deploy from GitHub" wizard adds a health check on the
+    primary HTTP port even when fly.toml declares no http_service. The
+    bot itself only speaks long-poll HTTPS *outbound*, so without this
+    the deploy hangs at "timeout trying to get your app". Returns 200
+    "ok" on any path; we don't expose any sensitive info.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _send_ok(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", "3")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._send_ok()
+
+        def do_HEAD(self) -> None:  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, fmt: str, *args) -> None:  # silence stderr noise
+            return
+
+    def _serve() -> None:
+        try:
+            srv = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
+            log.info("health-check HTTP server listening on :%d", port)
+            srv.serve_forever()
+        except Exception as e:  # noqa: BLE001
+            log.warning("health-check server died: %s", e)
+
+    t = threading.Thread(target=_serve, name="health", daemon=True)
+    t.start()
+
+
 def _md_escape(s: str) -> str:
     """Escape characters that Telegram's legacy Markdown parser will eat.
 
@@ -1218,6 +1259,11 @@ def main() -> int:
     )
     bot_cfg = BotConfig.from_env()
     model_cfg = Config.from_env()
+    # Fly.io / Railway / Heroku expose $PORT and expect us to bind to it.
+    # Locally there's no PORT and we skip the health server.
+    port_env = os.getenv("PORT", "").strip()
+    if port_env.isdigit():
+        _start_health_server(int(port_env))
     app = build_app(bot_cfg, model_cfg)
     log.info(
         "review bot starting; source=@%s; owner=%s; allowlist_seed=%s; allowlist_path=%s",
