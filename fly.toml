@@ -1,36 +1,37 @@
-# fly.io app configuration for the Sticker Pad review bot.
+# fly.toml app configuration file generated for sticker-moderation-bot on 2026-05-05T22:03:45Z
 #
-# This bot is a long-poll Telegram client — no inbound HTTP, no public
-# ports, just one always-on process. We run a single shared VM with a
-# persistent volume mounted at /data for the rules store, allowlist,
-# and the Telegram thumbnail cache.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
-# After `fly launch` (or `fly deploy`):
-#   fly secrets set ANTHROPIC_API_KEY=...   \
-#                   REVIEW_BOT_TOKEN=...    \
-#                   TELEGRAM_BOT_TOKEN=...  \
-#                   OWNER_USER_ID=2580397   \
-#                   SOURCE_BOT_USERNAME=sticker_bot
-#   fly volumes create review_bot_data --size 1 --region ams
-#   fly deploy
 
-app = "sticker-moderation-bot"   # change to your unique app name in fly launch
-primary_region = "ams"           # any region works; pick one near you
+app = 'sticker-moderation-bot'
+primary_region = 'ams'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
+
+[deploy]
+  strategy = 'immediate'
 
 [env]
   PYTHONUNBUFFERED = "1"
   PORT = "8080"
 
 [[mounts]]
-  source = "review_bot_data"
-  destination = "/data"
+  source = 'review_bot_data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
+  size = 'shared-cpu-1x'
+  memory = '512mb'
+  cpu_kind = 'shared'
   cpus = 1
 
 # The bot itself uses Telegram long-polling (outbound only). We also
