@@ -928,6 +928,31 @@ class ReviewBot:
         else:
             head = "❌ *REJECT*"
 
+        score = verdict.get("risk_score")
+        score_part = f" — risk {score}/100" if isinstance(score, int) else ""
+
+        # Pack info line: title · sticker count · type · clickable slug.
+        info_bits: list[str] = []
+        if sticker_meta.get("title"):
+            info_bits.append(f"*{_md_escape(sticker_meta['title'])}*")
+        count = sticker_meta.get("count")
+        if isinstance(count, int) and count > 0:
+            info_bits.append(f"{count} sticker{'s' if count != 1 else ''}")
+        if sticker_meta.get("is_video_pack"):
+            info_bits.append("video")
+        elif sticker_meta.get("is_animated_pack"):
+            info_bits.append("animated")
+        elif count:
+            info_bits.append("static")
+        # Show the slug as a clickable link to the pack so the human can
+        # open it in one tap. Slug often contains underscores → escape.
+        slug = slug_from_url(pack_url) if pack_url else ""
+        if slug:
+            info_bits.append(f"[{_md_escape(slug)}]({pack_url})")
+        elif pack_url:
+            info_bits.append(pack_url)
+        info_line = "📦 " + " · ".join(info_bits) if info_bits else ""
+
         reason = (verdict.get("reasoning") or "").strip()
         if not reason:
             reason = "(no reason supplied)"
@@ -940,17 +965,20 @@ class ReviewBot:
         if concerns:
             concern_line = "\n_Flags:_ " + ", ".join(concerns[:6])
 
-        meta_bits = []
-        if sticker_meta.get("title"):
-            meta_bits.append(f"\"{sticker_meta['title']}\"")
-        if sticker_meta.get("count"):
-            meta_bits.append(f"{sticker_meta['count']} stickers")
-        meta_line = (" — " + " · ".join(meta_bits)) if meta_bits else ""
+        # Errors that didn't escalate to a hard reject (e.g. a partial
+        # Claude batch failure) — surface them so the human knows.
+        err = verdict.get("error")
+        err_line = f"\n_Notes:_ {err}" if err else ""
 
-        score = verdict.get("risk_score")
-        score_line = f" _(risk {score}/100)_" if isinstance(score, int) else ""
-
-        return f"{head}{score_line}{meta_line}\n{reason}{concern_line}"
+        parts = [f"{head}{score_part}"]
+        if info_line:
+            parts.append(info_line)
+        parts.append(reason)
+        if concern_line:
+            parts.append(concern_line.lstrip("\n"))
+        if err_line:
+            parts.append(err_line.lstrip("\n"))
+        return "\n".join(parts)
 
     # ---------- /addrule ingestion via Claude ----------
 
