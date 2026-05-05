@@ -300,6 +300,8 @@ class ReviewBot:
         self.app_buffers: dict[int, ApplicationBuffer] = {}  # by chat_id
         self.app_debounce_s: float = 3.0
         self.pending_rule_input: dict[int, PendingRuleInput] = {}  # by user_id
+        self.started_at: float = time.time()
+        self.reviews_served: int = 0  # incremented per posted verdict
         # Track verdict messages we posted so we can recognize replies as
         # disagreement signals: bot_message_id -> {original_msg_id, pack_url, verdict, reasoning}
         self.verdict_index: dict[int, dict] = {}
@@ -375,7 +377,8 @@ class ReviewBot:
             "• /delrule <id> — remove an amendment\n"
             "• /listrules — compact list of amendments only\n"
             "• /chats — list whitelisted group chats\n"
-            "• /leavechat <chat_id> — un-whitelist and leave a group\n\n"
+            "• /leavechat <chat_id> — un-whitelist and leave a group\n"
+            "• /admin — runtime status, model, host, uptime\n\n"
             "If you disagree with a verdict, *reply to my message* with the correct decision "
             "(\"approve\" or \"reject\") and a short reason. I'll learn from it.\n\n"
             "_This bot is owner-locked: only you can DM me, and I only join chats *you* personally add me to._"
@@ -450,6 +453,78 @@ class ReviewBot:
         await msg.reply_text(
             f"🗑 Removed amendment `#{a.id}` ({a.category}): {a.text}",
             parse_mode=ParseMode.MARKDOWN,
+        )
+
+    async def cmd_admin(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = await self._gate(update)
+        user = update.effective_user
+        if not msg or not user:
+            return
+        if not self.is_owner(user.id):
+            return
+
+        # Detect host: fly.io / Railway / Render / generic / local.
+        host = "local"
+        host_extra = ""
+        if os.getenv("FLY_APP_NAME"):
+            host = "fly.io"
+            host_extra = (
+                f" · app `{_md_escape(os.getenv('FLY_APP_NAME', ''))}`"
+                f" · region `{_md_escape(os.getenv('FLY_REGION', '?'))}`"
+                f" · machine `{_md_escape((os.getenv('FLY_MACHINE_ID', '') or '?')[:12])}`"
+            )
+        elif os.getenv("RAILWAY_ENVIRONMENT"):
+            host = "railway"
+        elif os.getenv("RENDER"):
+            host = "render"
+        elif os.getenv("KUBERNETES_SERVICE_HOST"):
+            host = "kubernetes"
+
+        uptime_s = time.time() - self.started_at
+        started_iso = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(self.started_at))
+
+        try:
+            me = await ctx.bot.get_me()
+            bot_handle = f"@{me.username}" if me.username else f"id={me.id}"
+        except Exception:  # noqa: BLE001
+            bot_handle = "(unknown)"
+
+        py_ver = sys.version.split()[0]
+
+        lines = [
+            "*🛠 Admin status*",
+            "",
+            f"• *Bot:* {_md_escape(bot_handle)}",
+            f"• *Host:* `{host}`{host_extra}",
+            f"• *PID:* `{os.getpid()}` · *Python:* `{py_ver}`",
+            f"• *Started:* {started_iso}",
+            f"• *Uptime:* {_format_uptime(uptime_s)}",
+            "",
+            "*🤖 Models*",
+            f"• *Review (vision + verdict):* `{_md_escape(self.model_cfg.claude_model)}`",
+            f"• *Rule curator / learner:* `{_md_escape(self.model_cfg.claude_model)}` (same)",
+            "",
+            "*📊 Activity since boot*",
+            f"• *Verdicts posted:* {self.reviews_served}",
+            f"• *Verdict index size:* {len(self.verdict_index)}",
+            f"• *Pending application buffers:* {len(self.app_buffers)}",
+            "",
+            "*📋 State*",
+            f"• *Active rule amendments:* {len(self.rules.active())}",
+            f"• *Whitelisted chats:* {len(self.allowlist.all())}",
+            f"• *Owner id:* `{self.bot_cfg.owner_user_id}`",
+            f"• *Source bot:* @{_md_escape(self.bot_cfg.source_bot_username)}",
+            "",
+            "*💾 Storage paths*",
+            f"• *Rules store:* `{_md_escape(str(self.rules.path))}`",
+            f"• *Allowlist:* `{_md_escape(str(self.allowlist.path))}`",
+            f"• *TG cache:* `{_md_escape(str(self.bot_cfg.tg_cache_dir))}`",
+        ]
+        await _safe_reply(
+            msg,
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
         )
 
     async def cmd_chats(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -846,6 +921,7 @@ class ReviewBot:
             do_quote=True,
         )
 
+        self.reviews_served += 1
         # Index this verdict so a reply can be recognized as a correction.
         self.verdict_index[sent.message_id] = {
             "original_message_id": anchor.message_id,
@@ -1323,6 +1399,21 @@ async def _safe_reply(
         return await msg.reply_text(_strip_markdown(text), **kwargs)
 
 
+def _format_uptime(seconds: float) -> str:
+    """Human-readable uptime: '3d 14h 22m', '2h 5m', '47s'."""
+    s = int(max(seconds, 0))
+    d, r = divmod(s, 86400)
+    h, r = divmod(r, 3600)
+    m, sec = divmod(r, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
+
+
 def _first_line(s: str) -> str:
     for line in (s or "").splitlines():
         line = line.strip()
@@ -1348,6 +1439,7 @@ def build_app(bot_cfg: BotConfig, model_cfg: Config) -> Application:
     app.add_handler(CommandHandler("listrules", bot.cmd_listrules))
     app.add_handler(CommandHandler("chats", bot.cmd_chats))
     app.add_handler(CommandHandler("leavechat", bot.cmd_leavechat))
+    app.add_handler(CommandHandler("admin", bot.cmd_admin))
     # Bot-membership changes (so we can auto-whitelist / auto-leave).
     app.add_handler(
         ChatMemberHandler(bot.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER)
