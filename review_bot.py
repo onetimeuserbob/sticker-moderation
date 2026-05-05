@@ -325,7 +325,7 @@ class ReviewBot:
             return
         text = (
             "👋 Hi, I'm the *Sticker Pad* moderation reviewer.\n\n"
-            f"In group chats I read applications posted by @{self.bot_cfg.source_bot_username} "
+            f"In group chats I read applications posted by @{_md_escape(self.bot_cfg.source_bot_username)} "
             "and reply with ✅ APPROVE or ❌ REJECT plus a one-line reason.\n\n"
             "*Test me here:* send a pack as 2 photos (logo + cover) with a caption containing "
             "the `t.me/addstickers/<slug>` link, or just paste the link alone — I'll review.\n\n"
@@ -428,8 +428,8 @@ class ReviewBot:
             return
         lines = ["*Whitelisted chats:*"]
         for cid, meta in rows:
-            title = meta.get("title") or "(untitled)"
-            ctype = meta.get("type") or "?"
+            title = _md_escape(meta.get("title") or "(untitled)")
+            ctype = _md_escape(meta.get("type") or "?")
             lines.append(f"`{cid}` — {title} _({ctype})_")
         await msg.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -457,7 +457,7 @@ class ReviewBot:
         try:
             await ctx.bot.leave_chat(chat_id=target)
             await msg.reply_text(
-                f"👋 Left and un-whitelisted `{target}` ({entry.get('title', '')}).",
+                f"👋 Left and un-whitelisted `{target}` ({_md_escape(entry.get('title', ''))}).",
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as e:  # noqa: BLE001
@@ -516,9 +516,9 @@ class ReviewBot:
                     "_Reminder: turn off privacy mode in @BotFather (`/setprivacy` → "
                     "Disable) or make me a chat admin so I can read group messages._".format(
                         cid=chat.id,
-                        title=chat.title or "(untitled)",
+                        title=_md_escape(chat.title or "(untitled)"),
                         ctype=chat.type,
-                        src=self.bot_cfg.source_bot_username,
+                        src=_md_escape(self.bot_cfg.source_bot_username),
                     ),
                 )
             else:
@@ -540,9 +540,9 @@ class ReviewBot:
                     ctx,
                     "⚠️ {who} tried to add me to chat `{cid}` (*{title}*). "
                     "I left immediately. Use /chats to verify.".format(
-                        who=actor_label,
+                        who=_md_escape(actor_label),
                         cid=chat.id,
-                        title=chat.title or "(untitled)",
+                        title=_md_escape(chat.title or "(untitled)"),
                     ),
                 )
             return
@@ -556,7 +556,7 @@ class ReviewBot:
                     ctx,
                     "🚪 I was removed from chat `{cid}` ({title}). Un-whitelisted.".format(
                         cid=chat.id,
-                        title=entry.get("title", "(untitled)"),
+                        title=_md_escape(entry.get("title", "(untitled)")),
                     ),
                 )
 
@@ -1123,6 +1123,14 @@ Output ONLY a JSON object:
 
 
 # ---------- helpers ----------
+
+def _md_escape(s: str) -> str:
+    """Escape characters that Telegram's legacy Markdown parser will eat.
+
+    Underscores in usernames like @sticker_bot get turned into italic
+    delimiters otherwise."""
+    return (s or "").replace("_", r"\_").replace("*", r"\*").replace("`", r"\`")
+
 
 def _first_line(s: str) -> str:
     for line in (s or "").splitlines():
