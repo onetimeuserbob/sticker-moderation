@@ -838,7 +838,8 @@ class ReviewBot:
                 await checking_msg.delete()
             except Exception as e:  # noqa: BLE001
                 log.warning("could not delete 'Checking…' placeholder: %s", e)
-        sent = await anchor.reply_text(
+        sent = await _safe_reply(
+            anchor,
             verdict_text,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
@@ -953,14 +954,18 @@ class ReviewBot:
             info_bits.append(pack_url)
         info_line = "📦 " + " · ".join(info_bits) if info_bits else ""
 
-        reason = (verdict.get("reasoning") or "").strip()
+        # Claude's reasoning + concerns are freeform text and routinely
+        # contain *, _, `, [, ] which trip Telegram's Markdown parser
+        # ("Can't parse entities" -> the message gets rejected entirely).
+        # Escape them defensively before interpolating.
+        reason = _md_escape((verdict.get("reasoning") or "").strip())
         if not reason:
             reason = "(no reason supplied)"
 
         concerns: list[str] = []
         for k in ("ip_concerns", "nsfw_concerns", "pii_concerns", "scam_concerns"):
             for c in verdict.get(k) or []:
-                concerns.append(c)
+                concerns.append(_md_escape(str(c)))
         concern_line = ""
         if concerns:
             concern_line = "\n_Flags:_ " + ", ".join(concerns[:6])
@@ -968,7 +973,7 @@ class ReviewBot:
         # Errors that didn't escalate to a hard reject (e.g. a partial
         # Claude batch failure) — surface them so the human knows.
         err = verdict.get("error")
-        err_line = f"\n_Notes:_ {err}" if err else ""
+        err_line = f"\n_Notes:_ {_md_escape(str(err))}" if err else ""
 
         parts = [f"{head}{score_part}"]
         if info_line:
@@ -1269,8 +1274,53 @@ def _md_escape(s: str) -> str:
     """Escape characters that Telegram's legacy Markdown parser will eat.
 
     Underscores in usernames like @sticker_bot get turned into italic
-    delimiters otherwise."""
-    return (s or "").replace("_", r"\_").replace("*", r"\*").replace("`", r"\`")
+    delimiters; lone `*` / `_` / `` ` `` / `[` in Claude's freeform
+    reasoning trip "can't parse entities" and the whole message gets
+    rejected. Order matters: backslash first so we don't double-escape
+    our own escapes."""
+    return (
+        (s or "")
+        .replace("\\", r"\\")
+        .replace("_", r"\_")
+        .replace("*", r"\*")
+        .replace("`", r"\`")
+        .replace("[", r"\[")
+    )
+
+
+def _strip_markdown(s: str) -> str:
+    """Best-effort Markdown -> plain text for fallback delivery."""
+    out = (s or "")
+    out = re.sub(r"\\([_\\*`\[\]])", r"\1", out)  # un-escape
+    out = re.sub(r"\*([^*\n]+)\*", r"\1", out)     # *bold*
+    out = re.sub(r"_([^_\n]+)_", r"\1", out)       # _italic_
+    out = re.sub(r"`([^`\n]+)`", r"\1", out)       # `code`
+    out = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", out)  # [t](u) -> t (u)
+    return out
+
+
+async def _safe_reply(
+    msg: "Message",
+    text: str,
+    **kwargs,
+) -> "Message | None":
+    """Reply with Markdown; on parse failure, retry as plain text.
+
+    Telegram returns BadRequest "Can't parse entities" if any
+    Markdown delimiter is unbalanced — even one stray `*` in a long
+    Claude reasoning string. The whole verdict is then dropped, which
+    is much worse than losing the bold/italic. This wrapper guarantees
+    delivery."""
+    from telegram.error import BadRequest
+
+    try:
+        return await msg.reply_text(text, **kwargs)
+    except BadRequest as e:
+        if "parse entities" not in str(e).lower():
+            raise
+        log.warning("markdown parse failed, falling back to plain text: %s", e)
+        kwargs.pop("parse_mode", None)
+        return await msg.reply_text(_strip_markdown(text), **kwargs)
 
 
 def _first_line(s: str) -> str:
