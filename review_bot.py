@@ -209,6 +209,53 @@ def find_pack_url(text: str) -> str | None:
     return m.group(0) if m else None
 
 
+def _find_pack_url_in_entities(msgs: list[Message]) -> str | None:
+    """Look for a t.me/addstickers/<slug> URL hidden inside message
+    entities (text_link, url) of any buffered message. @sticker_bot
+    sometimes sends the link as a clickable entity rather than as
+    visible text, in which case msg.text alone won't contain it.
+
+    Telegram offers two relevant entity types:
+      - "url"        — visible URL in the text (covered by the regex
+                       on the visible text already, but checked again
+                       to handle tricky encodings).
+      - "text_link"  — visible label with a hidden URL on entity.url.
+    We also walk reply_markup inline buttons for `url` fields.
+    """
+    for m in msgs:
+        for ent in (m.entities or []) + (m.caption_entities or []):
+            url = getattr(ent, "url", None)
+            if not url:
+                # For "url"-type entities the URL is the substring of
+                # text/caption at [offset, offset+length).
+                if getattr(ent, "type", "") == "url":
+                    src = m.text or m.caption or ""
+                    try:
+                        url = src[ent.offset : ent.offset + ent.length]
+                    except Exception:  # noqa: BLE001
+                        url = None
+            if url:
+                hit = find_pack_url(url)
+                if hit:
+                    return hit
+        markup = getattr(m, "reply_markup", None)
+        if markup is not None:
+            for row in getattr(markup, "inline_keyboard", []) or []:
+                for btn in row or []:
+                    btn_url = getattr(btn, "url", None)
+                    if btn_url:
+                        hit = find_pack_url(btn_url)
+                        if hit:
+                            return hit
+        # link_preview_options.url — Telegram's auto-fetched preview.
+        lpo = getattr(m, "link_preview_options", None)
+        if lpo is not None:
+            hit = find_pack_url(getattr(lpo, "url", "") or "")
+            if hit:
+                return hit
+    return None
+
+
 def message_text_or_caption(msg: Message) -> str:
     return (msg.text or msg.caption or "").strip()
 
@@ -814,7 +861,20 @@ class ReviewBot:
 
         # Aggregate text and pack URL across all messages in the group.
         full_text = "\n".join(message_text_or_caption(m) for m in msgs).strip()
-        pack_url = find_pack_url(full_text) or ""
+        # Some messages put the URL only in entities (text_link / url) rather
+        # than the visible text. Sweep entities/caption_entities of every
+        # buffered message so we don't miss a button-style link.
+        pack_url = find_pack_url(full_text) or _find_pack_url_in_entities(msgs) or ""
+
+        log.info(
+            "review: msgs=%d photos=%d text_len=%d pack_url=%r",
+            len(msgs),
+            sum(1 for m in msgs if m.photo),
+            len(full_text),
+            pack_url,
+        )
+        if not pack_url and full_text:
+            log.info("review: no pack URL parsed; text head=%r", full_text[:300])
 
         # Post a placeholder so the user knows we're working. We'll
         # delete it right before posting the real verdict. do_quote=True
