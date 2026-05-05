@@ -214,16 +214,40 @@ def message_text_or_caption(msg: Message) -> str:
 
 
 def is_from_source_bot(msg: Message, source_username: str) -> bool:
+    """True if this message either was sent by the source bot or was
+    forwarded from it. Uses python-telegram-bot v21+ forward_origin API."""
+    target = (source_username or "").lower().lstrip("@")
+    if not target:
+        return False
+
     sender = msg.from_user
-    if sender and sender.username and sender.username.lower() == source_username.lower():
+    if sender and sender.username and sender.username.lower() == target:
         return True
-    # If the message was forwarded from the source bot, also accept.
-    fwd = msg.forward_from
-    if fwd and fwd.username and fwd.username.lower() == source_username.lower():
+
+    origin = getattr(msg, "forward_origin", None)
+    if origin is None:
+        return False
+
+    # MessageOriginUser  -> .sender_user (User)
+    user = getattr(origin, "sender_user", None)
+    if user and user.username and user.username.lower() == target:
         return True
-    fwd_chat = msg.forward_from_chat
-    if fwd_chat and getattr(fwd_chat, "username", "") and fwd_chat.username.lower() == source_username.lower():
+
+    # MessageOriginChat  -> .sender_chat (Chat)
+    chat = getattr(origin, "sender_chat", None)
+    if chat and getattr(chat, "username", "") and chat.username.lower() == target:
         return True
+
+    # MessageOriginChannel  -> .chat (Chat)
+    channel = getattr(origin, "chat", None)
+    if channel and getattr(channel, "username", "") and channel.username.lower() == target:
+        return True
+
+    # MessageOriginHiddenUser  -> .sender_user_name (str)
+    hidden_name = getattr(origin, "sender_user_name", None)
+    if hidden_name and hidden_name.lower() == target:
+        return True
+
     return False
 
 
@@ -689,7 +713,16 @@ class ReviewBot:
         full_text = "\n".join(message_text_or_caption(m) for m in msgs).strip()
         pack_url = find_pack_url(full_text) or ""
 
-        # Show typing while we work.
+        # Post a placeholder so the user knows we're working. We'll
+        # delete it right before posting the real verdict.
+        checking_msg: Message | None = None
+        try:
+            checking_msg = await anchor.reply_text(
+                "🔍 Checking application…",
+                disable_notification=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not send 'Checking…' placeholder: %s", e)
         try:
             await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
         except Exception:  # noqa: BLE001
@@ -767,6 +800,13 @@ class ReviewBot:
             }
 
         verdict_text = self._format_verdict(verdict, sticker_meta, pack_url)
+        # Delete the "Checking…" placeholder before posting the verdict so
+        # the chat has just one final message per application.
+        if checking_msg is not None:
+            try:
+                await checking_msg.delete()
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not delete 'Checking…' placeholder: %s", e)
         sent = await anchor.reply_text(
             verdict_text,
             parse_mode=ParseMode.MARKDOWN,
