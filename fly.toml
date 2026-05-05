@@ -1,16 +1,19 @@
-# fly.toml app configuration file generated for sticker-moderation-bot on 2026-05-05T22:03:45Z
+# fly.io app configuration for the Sticker Pad review bot.
 #
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+# The bot itself uses Telegram long-polling (outbound HTTPS only). We
+# bind a tiny health-check HTTP server on $PORT alongside it so fly's
+# deploy probes succeed. The machine stays running 24/7 (no auto-stop)
+# because long-poll bots don't generate inbound traffic that would keep
+# them awake.
 #
+# After changes here:
+#   fly deploy
 
 app = 'sticker-moderation-bot'
 primary_region = 'ams'
 
 [build]
   dockerfile = 'Dockerfile'
-
-[deploy]
-  strategy = 'immediate'
 
 [env]
   PYTHONUNBUFFERED = "1"
@@ -23,9 +26,9 @@ primary_region = 'ams'
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['app']
 
 [[vm]]
@@ -34,15 +37,5 @@ primary_region = 'ams'
   cpu_kind = 'shared'
   cpus = 1
 
-# The bot itself uses Telegram long-polling (outbound only). We also
-# bind a tiny health-check HTTP server on $PORT so fly's deploy probes
-# get a 200, and the machine stays running 24/7 (no auto-stop).
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = false
-  auto_start_machines = true
-  min_machines_running = 1
-
 [deploy]
-  strategy = "immediate"
+  strategy = 'immediate'
