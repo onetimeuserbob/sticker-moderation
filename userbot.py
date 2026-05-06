@@ -120,10 +120,28 @@ class UserbotRelay:
         )
         self.client.add_event_handler(self._on_new_message, events.NewMessage())
         self.client.add_event_handler(self._on_chat_action, events.ChatAction())
-        # Run in background; Telethon manages its own loop integration.
-        # No await client.run_until_disconnected() — we want to return so
-        # PTB's polling can take over the main loop. Telethon dispatches
-        # events on the connected client without an explicit run loop.
+
+        # Force Telethon to (a) populate the dialog cache for chats we're
+        # already a member of and (b) consume any pending update difference
+        # accumulated while we were offline. Without these, fresh deploys
+        # have been observed to receive zero update events from chats that
+        # existed before the redeploy — the receiver loop is running but
+        # has nothing to dispatch because it never asked the server for
+        # the catch-up state.
+        try:
+            n_dialogs = 0
+            async for _ in self.client.iter_dialogs(limit=200):
+                n_dialogs += 1
+            log.info("userbot prefetched %d dialogs", n_dialogs)
+        except Exception as e:  # noqa: BLE001
+            log.warning("dialog prefetch failed: %s", e)
+        try:
+            await self.client.catch_up()
+            log.info("userbot caught up on pending updates")
+        except Exception as e:  # noqa: BLE001
+            log.warning("catch_up failed: %s", e)
+        # Telethon now dispatches events on the connected client; we
+        # return and let the caller hold the asyncio loop open.
 
     async def stop(self) -> None:
         if self.client is not None:
@@ -325,14 +343,30 @@ class UserbotRelay:
         msg = event.message
         chat_id = self._normalize_chat_id(event.chat_id)
 
-        sender = await event.get_sender()
-        sender_id = getattr(sender, "id", None)
+        # Top-of-handler trace so EVERY inbound dispatch is visible in
+        # logs. Cheap, single line per event. If we ever go silent again
+        # this tells us instantly whether the dispatcher is alive.
+        try:
+            sender = await event.get_sender()
+        except Exception as e:  # noqa: BLE001
+            log.warning("get_sender failed: chat=%s msg_id=%s err=%s",
+                        chat_id, getattr(msg, "id", None), e)
+            sender = None
+        sender_id = getattr(sender, "id", None) if sender is not None else None
+        log.info(
+            "userbot rx: chat=%s sender=%s msg_id=%s photo=%s grouped=%s text_len=%d",
+            chat_id, sender_id, getattr(msg, "id", None),
+            bool(getattr(msg, "photo", None)),
+            getattr(msg, "grouped_id", None),
+            len(getattr(msg, "message", "") or ""),
+        )
+
         if sender_id is None:
+            log.info("drop: sender_id is None (chat=%s msg_id=%s)",
+                     chat_id, getattr(msg, "id", None))
             return
-        # Skip our own user account (don't review messages we typed).
         if sender_id == self._me_id:
             return
-        # Skip the moderator bot itself (its own verdicts).
         if self._bot_id and sender_id == self._bot_id:
             return
 
