@@ -46,30 +46,68 @@ log = logging.getLogger("userbot")
 
 
 _PACK_URL_RE = re.compile(r"https?://t\.me/addstickers/[A-Za-z0-9_]+", re.I)
+# Once a pack has been approved by the operator, @sticker_bot stops
+# showing the t.me/addstickers/<slug> apply-link and instead links to a
+# preview deep-link of the form  https://t.me/sticker_bot/<anything> .
+# Messages that contain this marker are NOT applications — they're
+# already-handled previews, and re-reviewing them is exactly what we
+# do not want.
+_APPROVED_LINK_RE = re.compile(r"https?://t\.me/sticker_bot(?:/|\?|$)", re.I)
+# How far back in time the live path is willing to act on a source-bot
+# application. iter_messages-based replay uses the same constant. This
+# protects us from Telethon's catch_up() dispatching hours-old missed
+# updates as if they were fresh, and from users (or the bot itself)
+# scrolling back through old chats.
+MAX_LIVE_APP_AGE_S = 5 * 60
+
+
+def _msg_age_s(msg) -> float | None:
+    """Seconds since ``msg.date`` (UTC). Returns None if no date."""
+    d = getattr(msg, "date", None)
+    if d is None:
+        return None
+    try:
+        return time.time() - d.timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _iter_msg_urls(msg):
+    """Yield every URL referenced by a Telethon message: visible text,
+    text-url entities, inline-button urls."""
+    text = msg.message or ""
+    yield text  # we'll regex-search the whole text blob
+    for ent in (msg.entities or []):
+        url = getattr(ent, "url", None)
+        if url:
+            yield url
+    rm = getattr(msg, "reply_markup", None)
+    rows = getattr(rm, "rows", None) or []
+    for row in rows:
+        for btn in getattr(row, "buttons", []) or []:
+            url = getattr(btn, "url", None)
+            if url:
+                yield url
 
 
 def _find_pack_url_in_telethon_msg(msg) -> str:
     """Pull a t.me/addstickers/<slug> URL out of a Telethon Message,
     checking visible text, MessageEntityTextUrl entries, and reply
     markup buttons. Returns "" if none."""
-    text = msg.message or ""
-    m = _PACK_URL_RE.search(text)
-    if m:
-        return m.group(0)
-    # Hidden URLs in entities (e.g. when @sticker_bot posts a button-style link).
-    for ent in (msg.entities or []):
-        url = getattr(ent, "url", None)
-        if url and _PACK_URL_RE.search(url):
-            return _PACK_URL_RE.search(url).group(0)
-    # Inline keyboard buttons.
-    rm = getattr(msg, "reply_markup", None)
-    rows = getattr(rm, "rows", None) or []
-    for row in rows:
-        for btn in getattr(row, "buttons", []) or []:
-            url = getattr(btn, "url", None)
-            if url and _PACK_URL_RE.search(url):
-                return _PACK_URL_RE.search(url).group(0)
+    for url in _iter_msg_urls(msg):
+        m = _PACK_URL_RE.search(url)
+        if m:
+            return m.group(0)
     return ""
+
+
+def _has_approved_marker(msg) -> bool:
+    """True iff a source-bot message points at t.me/sticker_bot/...,
+    i.e. it's a published-pack preview, NOT an open application."""
+    for url in _iter_msg_urls(msg):
+        if _APPROVED_LINK_RE.search(url):
+            return True
+    return False
 
 
 @dataclass
@@ -216,18 +254,16 @@ class UserbotRelay:
         """For each whitelisted chat, walk recent history and process
         any source-bot application we don't already have a verdict for.
 
-        Bounded by REPLAY_AGE_MAX (24 h) and REPLAY_LIMIT (200 messages
-        per chat) so we never replay ancient history. Idempotent: relies
-        on verdict_index to skip applications already reviewed.
-
-        Media-group anchoring: messages are fed through the same
-        ``_buffer()`` debouncer as live traffic, so a multi-part
-        application (logo + cover + text-with-link) coalesces into one
-        review with the same anchor message id it would have had live —
-        which means the verdict_index check is consistent across
-        replays.
+        Bounded by ``MAX_LIVE_APP_AGE_S`` (5 min) and ``REPLAY_LIMIT``
+        (200 messages per chat). The 5-minute window is intentional:
+        if we were down longer than that, the operator has likely
+        already handled the queue manually, and re-reviewing day-old
+        applications would (a) re-review packs that were already
+        approved (their messages get edited to t.me/sticker_bot/<slug>
+        previews — see ``_has_approved_marker``) and (b) waste Claude
+        budget. Idempotent via verdict_index.
         """
-        REPLAY_AGE_MAX = 24 * 3600
+        REPLAY_AGE_MAX = MAX_LIVE_APP_AGE_S
         REPLAY_LIMIT = 200
         if self.client is None:
             return
@@ -275,6 +311,16 @@ class UserbotRelay:
                         or _find_pack_url_in_telethon_msg(m)
                     )
                     if not looks_like_app:
+                        continue
+                    # Skip already-approved previews: @sticker_bot edits
+                    # the original application after approval to point at
+                    # t.me/sticker_bot/<slug>, and that edited message
+                    # still looks "app-shaped" (photos, grouped, etc.).
+                    if _has_approved_marker(m):
+                        log.info(
+                            "replay: skipping already-approved post chat=%s msg_id=%s",
+                            chat_id, m.id,
+                        )
                         continue
                     candidates.append(m)
             except Exception as e:  # noqa: BLE001
@@ -324,14 +370,25 @@ class UserbotRelay:
 
             replayed = 0
             skipped = 0
+            stale = 0
             for msgs in buckets:
                 anchor_id = min(m.id for m in msgs)
+                anchor_msg = min(msgs, key=lambda x: x.id)
+                age = _msg_age_s(anchor_msg)
+                if age is not None and age > MAX_LIVE_APP_AGE_S:
+                    stale += 1
+                    log.info(
+                        "replay: skipping stale batch chat=%s anchor=%s age=%.0fs",
+                        chat_id, anchor_id, age,
+                    )
+                    continue
                 if (chat_id, anchor_id) in already:
                     skipped += 1
                     continue
                 log.info(
-                    "replay: processing missed batch chat=%s anchor=%s parts=%d",
+                    "replay: processing missed batch chat=%s anchor=%s parts=%d age=%.0fs",
                     chat_id, anchor_id, len(msgs),
+                    age if age is not None else -1.0,
                 )
                 # Process atomically — DO NOT route through _buffer, as
                 # the debouncer's per-chat coalescing would fuse all
@@ -349,8 +406,8 @@ class UserbotRelay:
                 await asyncio.sleep(1.0)
 
             log.info(
-                "replay: chat=%s — %d batch(es) total, %d processed, %d already done",
-                chat_id, len(buckets), replayed, skipped,
+                "replay: chat=%s — %d batch(es) total, %d processed, %d already done, %d stale",
+                chat_id, len(buckets), replayed, skipped, stale,
             )
 
     # ---------- Outgoing primitives (used by ReviewBot.run_review) ----------
@@ -653,6 +710,25 @@ class UserbotRelay:
             or sender_id in self.bot_cfg.source_bot_ids
         ):
             if looks_like_app:
+                # Already-approved preview — @sticker_bot's edited
+                # post-approval message links to t.me/sticker_bot/<slug>
+                # instead of t.me/addstickers/<slug>. Don't re-review it.
+                if _has_approved_marker(msg):
+                    log.info(
+                        "ignoring already-approved source-bot post: chat=%s msg_id=%s",
+                        chat_id, msg.id,
+                    )
+                    return
+                # Stale dispatch — could happen when Telethon's catch_up()
+                # replays updates from a prior downtime window or when
+                # someone forwards / scrolls into old history.
+                age = _msg_age_s(msg)
+                if age is not None and age > MAX_LIVE_APP_AGE_S:
+                    log.info(
+                        "ignoring stale source-bot app: chat=%s msg_id=%s age=%.0fs (max %ds)",
+                        chat_id, msg.id, age, MAX_LIVE_APP_AGE_S,
+                    )
+                    return
                 log.info(
                     "userbot saw app-part: chat=%s sender=%s msg_id=%s photo=%s grouped=%s pack_url=%r",
                     chat_id, sender_id, msg.id, bool(msg.photo), msg.grouped_id, pack_url,
