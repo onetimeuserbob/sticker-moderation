@@ -154,14 +154,24 @@ class UserbotRelay:
         If Telethon's md parser rejects the text we strip Markdown and retry."""
         from review_bot import _strip_markdown
         try:
-            return await self.send_message(
+            sent = await self.send_message(
                 chat_id, text, reply_to=reply_to, markdown=True
             )
+            log.info(
+                "userbot sent: chat=%s reply_to=%s msg_id=%s bytes=%d",
+                chat_id, reply_to, getattr(sent, "id", None), len(text),
+            )
+            return sent
         except (RPCError, ValueError) as e:
             log.warning("telethon md send failed (%s); falling back to plain", e)
-            return await self.send_message(
+            sent = await self.send_message(
                 chat_id, _strip_markdown(text), reply_to=reply_to, markdown=False
             )
+            log.info(
+                "userbot sent (plain fallback): chat=%s reply_to=%s msg_id=%s",
+                chat_id, reply_to, getattr(sent, "id", None),
+            )
+            return sent
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         if self.client is None:

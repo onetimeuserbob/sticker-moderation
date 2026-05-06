@@ -1304,6 +1304,10 @@ class ReviewBot:
         )
         decision = result.get("decision", "noop")
         reason = (result.get("reason") or "").strip()
+        log.info(
+            "process_correction: decision=%s amend_id=%s category=%s reason=%r",
+            decision, result.get("amend_id"), result.get("category"), reason[:120],
+        )
 
         if decision == "noop":
             return (
