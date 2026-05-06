@@ -244,10 +244,10 @@ class UserbotRelay:
             for v in self.review_bot.verdict_index.values()
         }
 
+        # Allowlist.all() returns [(chat_id, meta_dict), …] sorted by added_at.
         chats = self.review_bot.allowlist.all()
         log.info("replay: scanning %d whitelisted chat(s) for missed apps", len(chats))
-        for entry in chats:
-            chat_id = entry.get("chat_id")
+        for chat_id, _meta in chats:
             if chat_id is None:
                 continue
             try:
