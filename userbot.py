@@ -323,32 +323,10 @@ class UserbotRelay:
                         user_text=user_text,
                     )
                     return
-            else:
-                # Owner replied to *something*, but we don't recognize it as
-                # one of our verdicts. Most common cause: process restart
-                # wiped verdict_index, or reply was to a different message.
-                # Tell the owner so they don't think we silently swallowed
-                # their feedback.
-                log.warning(
-                    "owner reply to unknown msg_id=%s in chat=%s "
-                    "(verdict_index has %d entries) — feedback NOT applied",
-                    replied_to_id, chat_id, len(self.review_bot.verdict_index),
-                )
-                try:
-                    await self.send_message(
-                        chat_id,
-                        (
-                            "⚠️ I see your reply but don't have a record of "
-                            "the verdict you're replying to (probably because "
-                            "I restarted after posting it). Please re-send the "
-                            "application so I can re-review and then reply to "
-                            "the new verdict — that one I'll remember."
-                        ),
-                        reply_to=msg.id,
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-                return
+            # else: replied_to_id isn't a known verdict. Don't treat it as a
+            # missed correction — it's just a normal reply (e.g. asking a
+            # question by replying to my intro / status / chat message). Fall
+            # through to the assistant path below.
 
         text_blob = msg.message or ""
         pack_url = _find_pack_url_in_telethon_msg(msg)
