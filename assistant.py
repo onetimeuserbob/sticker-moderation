@@ -128,7 +128,9 @@ class ModeratorAssistant:
             )
         else:
             amend_dump = "  (none yet)"
-        # Two-segment system: cacheable BASE policy + per-call dynamic part.
+        # Pretty, chat-ready summary of the FULL ruleset (base + amendments)
+        # — this is what users want to see when they ask "what are the rules?".
+        rules_summary = self.review_bot.rules.rules_summary()
         return [
             {
                 "type": "text",
@@ -137,14 +139,31 @@ class ModeratorAssistant:
                     "Pad moderation team. You are the user-facing voice of an "
                     "automated review pipeline. You help the team manage the "
                     "ruleset and answer questions about how applications are "
-                    "evaluated. Style: concise, plain English, no hype, no "
-                    "apologising. Use Telegram-flavour Markdown sparingly "
-                    "(only `*bold*`, `_italics_`, backticks for code/ids; no "
-                    "tables, no headers). When the user proposes a rule "
-                    "change, USE THE TOOLS — don't just say you'll add it; "
-                    "actually add it. After a tool call, briefly confirm what "
-                    "you did.\n\n"
-                    "## BASE MODERATION POLICY (reference)\n\n"
+                    "evaluated.\n\n"
+                    "## CRITICAL: The ruleset has TWO layers\n"
+                    "1. A SUBSTANTIAL BASE POLICY (~30 sections covering NFTs, "
+                    "Telegram Gifts, IP, NSFW, scams, war imagery, real-people "
+                    "PII, marketplace impersonation, etc.) — included below in "
+                    "full. This is the primary ruleset and is ALWAYS active.\n"
+                    "2. Operator AMENDMENTS — short carve-outs added on top of "
+                    "the base policy. These are NUMBERED separately (#1, #2…) "
+                    "and are listed below.\n\n"
+                    "When users ask 'what are the rules?', 'show me the rules', "
+                    "'what's the policy?', etc., reproduce the READY SUMMARY "
+                    "below verbatim (or trim to the parts they asked about) — "
+                    "do NOT call list_amendments and present the result as if "
+                    "it were the whole ruleset. Use list_amendments only when "
+                    "the user specifically asks for the operator amendments / "
+                    "custom rules / additions.\n\n"
+                    "Style: concise, plain English, no hype, no apologising. "
+                    "Use Telegram-flavour Markdown sparingly (only `*bold*`, "
+                    "`_italics_`, backticks for code/ids; no tables, no "
+                    "headers). When the user proposes a rule change, USE THE "
+                    "TOOLS — don't just say you'll add it; actually add it. "
+                    "After a tool call, briefly confirm what you did.\n\n"
+                    "## READY SUMMARY (reuse this when asked 'what are the rules')\n\n"
+                    + rules_summary
+                    + "\n\n## FULL BASE MODERATION POLICY (deep reference — quote from this when asked specifics)\n\n"
                     + CLAUDE_PROMPT
                 ),
                 "cache_control": {"type": "ephemeral"},
