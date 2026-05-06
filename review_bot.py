@@ -740,6 +740,16 @@ class ReviewBot:
         msg = update.effective_message
         if not msg:
             return
+        try:
+            sender = (msg.from_user.username or msg.from_user.first_name) if msg.from_user else "?"
+            log.debug(
+                "msg in chat=%s type=%s from=@%s photos=%s mg=%s text_len=%s",
+                msg.chat_id, msg.chat.type, sender,
+                bool(msg.photo), msg.media_group_id,
+                len(message_text_or_caption(msg) or ""),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         if not self.chat_allowed(msg):
             # Owner-locked: if a non-owner DM'd us, send a one-time polite
             # heads-up so they know not to expect a reply, then stay quiet.
@@ -784,32 +794,20 @@ class ReviewBot:
             await self._handle_disagreement(msg)
             return
 
-        # 3) Application detection. In groups: only act on @sticker_bot or
-        #    when the bot is explicitly mentioned/replied to. In private
-        #    chat: act on anything that looks like an application.
+        # 3) Application detection.
+        #    The chat_allowed() gate above already restricts us to: owner DM,
+        #    or owner-whitelisted group. Inside such a chat we trust anything
+        #    that LOOKS like an application (photo, media group, or pack URL),
+        #    regardless of which user/bot posted it. This way we don't have
+        #    to hard-code @sticker_bot's exact username.
         is_private = msg.chat.type == ChatType.PRIVATE
         from_source = is_from_source_bot(msg, self.bot_cfg.source_bot_username)
-        addressed_to_us = False
-        if not is_private and not from_source:
-            me = (await ctx.bot.get_me()).username or ""
-            text_blob = message_text_or_caption(msg)
-            if me and ("@" + me.lower()) in text_blob.lower():
-                addressed_to_us = True
-            elif msg.reply_to_message and msg.reply_to_message.from_user and \
-                    msg.reply_to_message.from_user.username and \
-                    msg.reply_to_message.from_user.username.lower() == me.lower():
-                addressed_to_us = True
 
-        if not (is_private or from_source or addressed_to_us):
-            return
-
-        # Only buffer messages that look like part of an application.
-        # Anything else (random chit-chat in DM, unrelated text in group)
-        # is silently ignored to avoid wasting Claude calls on it.
         looks_like_app_part = bool(
             msg.photo
             or msg.media_group_id
             or find_pack_url(message_text_or_caption(msg))
+            or _find_pack_url_in_entities(msg)
             or from_source
         )
         if not looks_like_app_part:
