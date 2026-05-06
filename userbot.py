@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from telethon import TelegramClient, events
+from telethon.errors import RPCError
 
 if TYPE_CHECKING:
     from review_bot import ReviewBot, BotConfig
@@ -117,6 +118,67 @@ class UserbotRelay:
                 await self.client.disconnect()
             except Exception:  # noqa: BLE001
                 pass
+
+    # ---------- Outgoing primitives (used by ReviewBot.run_review) ----------
+    # We expose send / delete / typing here so the moderation verdict can be
+    # posted UNDER the Moderator account, not the bot. Keeps a single
+    # identity in the chat.
+
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to: int | None = None,
+        markdown: bool = False,
+    ):
+        """Send via the Moderator user account. Returns the Telethon Message."""
+        if self.client is None:
+            raise RuntimeError("userbot client not started")
+        return await self.client.send_message(
+            chat_id,
+            text,
+            reply_to=reply_to,
+            parse_mode="md" if markdown else None,
+            link_preview=False,
+        )
+
+    async def send_message_safe(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to: int | None = None,
+    ):
+        """Markdown send with plain-text fallback (mirrors _safe_send for PTB).
+        If Telethon's md parser rejects the text we strip Markdown and retry."""
+        from review_bot import _strip_markdown
+        try:
+            return await self.send_message(
+                chat_id, text, reply_to=reply_to, markdown=True
+            )
+        except (RPCError, ValueError) as e:
+            log.warning("telethon md send failed (%s); falling back to plain", e)
+            return await self.send_message(
+                chat_id, _strip_markdown(text), reply_to=reply_to, markdown=False
+            )
+
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        if self.client is None:
+            return
+        try:
+            await self.client.delete_messages(chat_id, [message_id])
+        except Exception as e:  # noqa: BLE001
+            log.warning("telethon delete_message failed: %s", e)
+
+    async def send_typing(self, chat_id: int) -> None:
+        if self.client is None:
+            return
+        try:
+            async with self.client.action(chat_id, "typing"):
+                pass
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _on_new_message(self, event) -> None:
         msg = event.message

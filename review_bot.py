@@ -922,21 +922,38 @@ class ReviewBot:
         if not pack_url and full_text:
             log.info("review: no pack URL parsed; text head=%r", full_text[:300])
 
+        # Pick the transport that will POST the verdict. When the application
+        # came in via the userbot relay, post under the Moderator account
+        # (cleaner: only one identity in the chat). Bot DMs are still served
+        # by the bot itself.
+        use_userbot = source == "userbot" and self.userbot is not None
+
         # "Checking…" placeholder, replied to the application's anchor.
         checking_msg_id: int | None = None
         try:
-            sent = await self.bot.send_message(
-                chat_id=chat_id,
-                text="🔍 Checking application…",
-                reply_to_message_id=anchor_message_id,
-                allow_sending_without_reply=True,
-                disable_notification=True,
-            )
-            checking_msg_id = sent.message_id
+            if use_userbot:
+                sent = await self.userbot.send_message(
+                    chat_id=chat_id,
+                    text="🔍 Checking application…",
+                    reply_to=anchor_message_id,
+                )
+                checking_msg_id = sent.id
+            else:
+                sent = await self.bot.send_message(
+                    chat_id=chat_id,
+                    text="🔍 Checking application…",
+                    reply_to_message_id=anchor_message_id,
+                    allow_sending_without_reply=True,
+                    disable_notification=True,
+                )
+                checking_msg_id = sent.message_id
         except Exception as e:  # noqa: BLE001
             log.warning("could not send 'Checking…' placeholder: %s", e)
         try:
-            await self.bot.send_chat_action(chat_id=chat_id, action="typing")
+            if use_userbot:
+                await self.userbot.send_typing(chat_id)
+            else:
+                await self.bot.send_chat_action(chat_id=chat_id, action="typing")
         except Exception:  # noqa: BLE001
             pass
 
@@ -1005,22 +1022,34 @@ class ReviewBot:
 
         if checking_msg_id is not None:
             try:
-                await self.bot.delete_message(chat_id=chat_id, message_id=checking_msg_id)
+                if use_userbot:
+                    await self.userbot.delete_message(chat_id, checking_msg_id)
+                else:
+                    await self.bot.delete_message(chat_id=chat_id, message_id=checking_msg_id)
             except Exception as e:  # noqa: BLE001
                 log.warning("could not delete 'Checking…' placeholder: %s", e)
 
-        sent = await _safe_send(
-            self.bot,
-            chat_id=chat_id,
-            text=verdict_text,
-            reply_to_message_id=anchor_message_id,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-        )
+        if use_userbot:
+            sent = await self.userbot.send_message_safe(
+                chat_id=chat_id,
+                text=verdict_text,
+                reply_to=anchor_message_id,
+            )
+            sent_msg_id = getattr(sent, "id", None)
+        else:
+            sent = await _safe_send(
+                self.bot,
+                chat_id=chat_id,
+                text=verdict_text,
+                reply_to_message_id=anchor_message_id,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+            sent_msg_id = getattr(sent, "message_id", None)
 
         self.reviews_served += 1
-        if sent is not None:
-            self.verdict_index[sent.message_id] = {
+        if sent_msg_id is not None:
+            self.verdict_index[sent_msg_id] = {
                 "original_message_id": anchor_message_id,
                 "pack_url": pack_url,
                 "title": title,
