@@ -361,9 +361,15 @@ class UserbotRelay:
             if not is_owner:
                 return
             if looks_like_app:
+                fwd = getattr(msg, "forward", None)
+                fwd_info = ""
+                if fwd is not None:
+                    fwd_from_id = getattr(fwd, "sender_id", None) or getattr(fwd, "from_id", None)
+                    fwd_info = f" fwd_from={fwd_from_id} fwd_msg_id={getattr(fwd, 'channel_post', None)}"
                 log.info(
-                    "userbot saw OWNER-DM app-part: chat=%s msg_id=%s photo=%s pack_url=%r",
-                    chat_id, msg.id, bool(msg.photo), pack_url,
+                    "userbot saw OWNER-DM app-part: chat=%s msg_id=%s photo=%s text_len=%d pack_url=%r%s",
+                    chat_id, msg.id, bool(msg.photo),
+                    len(text_blob), pack_url, fwd_info,
                 )
                 await self._buffer(chat_id, msg)
                 return

@@ -940,23 +940,26 @@ class ReviewBot:
         handler and the Telethon userbot relay. Sends all chat output via
         self.bot (the moderator bot's identity), regardless of which
         transport observed the application."""
-        if self.bot is None:
-            log.error("run_review called before bot was initialized")
-            return
-
-        log.info(
-            "review[%s]: chat=%s anchor=%s photos=%d text_len=%d pack_url=%r",
-            source, chat_id, anchor_message_id,
-            len(photo_paths), len(full_text or ""), pack_url,
-        )
-        if not pack_url and full_text:
-            log.info("review: no pack URL parsed; text head=%r", full_text[:300])
-
         # Pick the transport that will POST the verdict. When the application
         # came in via the userbot relay, post under the Moderator account
         # (cleaner: only one identity in the chat). Bot DMs are still served
-        # by the bot itself.
-        use_userbot = source == "userbot" and self.userbot is not None
+        # by the bot itself. In userbot-only mode (BOT_ENABLED=false) self.bot
+        # is None, so userbot is the only option.
+        use_userbot = (source == "userbot" and self.userbot is not None) or (
+            self.bot is None and self.userbot is not None
+        )
+
+        if not use_userbot and self.bot is None:
+            log.error("run_review called but no transport available")
+            return
+
+        log.info(
+            "review[%s]: chat=%s anchor=%s photos=%d text_len=%d pack_url=%r use_userbot=%s",
+            source, chat_id, anchor_message_id,
+            len(photo_paths), len(full_text or ""), pack_url, use_userbot,
+        )
+        if not pack_url and full_text:
+            log.info("review: no pack URL parsed; text head=%r", full_text[:300])
 
         # "Checking…" placeholder, replied to the application's anchor.
         checking_msg_id: int | None = None
