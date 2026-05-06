@@ -993,9 +993,26 @@ class ReviewBot:
         # Pull the actual sticker thumbnails so Claude judges the real pack.
         sticker_paths: list[Path] = []
         sticker_meta: dict = {}
-        if pack_url:
+        problems: list[str] = []  # user-facing notes appended to the verdict
+
+        if not pack_url:
+            problems.append(
+                "⚠️ *No pack link in this batch.* I'll review the marketing "
+                "photos only — but I can't open the actual sticker pack to "
+                "check its contents. If you forwarded from @sticker\\_bot, "
+                "please also forward the *text message with the link* "
+                "(usually the message right after the two photos), or paste "
+                "the `t.me/addstickers/<slug>` link as a reply."
+            )
+        else:
             slug = slug_from_url(pack_url)
-            if slug:
+            if not slug:
+                problems.append(
+                    f"⚠️ *Bad pack URL:* `{_md_escape(pack_url)}` — I can't "
+                    "parse a slug from this. Expected format: "
+                    "`t.me/addstickers/<slug>`."
+                )
+            else:
                 try:
                     sticker_paths, sticker_meta = await asyncio.to_thread(
                         ingest_pack,
@@ -1007,20 +1024,40 @@ class ReviewBot:
                 except Exception as e:  # noqa: BLE001
                     log.warning("ingest_pack failed for %s: %s", slug, e)
                     sticker_meta = {"error": str(e)}
+                    problems.append(
+                        f"⚠️ *Couldn't open the sticker pack* `{_md_escape(slug)}`: "
+                        f"_{_md_escape(str(e))}_. Pack may be private, "
+                        "deleted, or my bot token doesn't have access. "
+                        "Verdict below treats this as unverifiable (RED)."
+                    )
 
         title = sticker_meta.get("title") or _first_line(full_text) or "(none)"
         description = full_text
         sticker_count = sticker_meta.get("count", 0)
 
         amendments_block = self.rules.amendments_block()
-        verdict = await asyncio.to_thread(
-            self._claude_review_with_amendments,
-            title,
-            description,
-            photo_paths,
-            sticker_paths,
-            amendments_block,
-        )
+        try:
+            verdict = await asyncio.to_thread(
+                self._claude_review_with_amendments,
+                title,
+                description,
+                photo_paths,
+                sticker_paths,
+                amendments_block,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("Claude review failed: %s", e)
+            problems.append(
+                f"❌ *Claude call failed:* _{_md_escape(str(e))}_. "
+                "I couldn't run the review. Try again in a moment."
+            )
+            verdict = {
+                "risk_category": "YELLOW",
+                "risk_score": 50,
+                "reasoning": f"Claude call failed: {e}. No verdict produced.",
+                "ip_concerns": [], "nsfw_concerns": [], "pii_concerns": [],
+                "scam_concerns": [], "error": str(e),
+            }
 
         # Sticker-count / unverifiable hard rules (mirror the offline pipeline).
         if pack_url and sticker_meta.get("error"):
@@ -1052,6 +1089,10 @@ class ReviewBot:
             }
 
         verdict_text = self._format_verdict(verdict, sticker_meta, pack_url)
+
+        # Surface any degraded-paths up-front so you know what was missing.
+        if problems:
+            verdict_text = "\n\n".join(problems) + "\n\n———\n\n" + verdict_text
 
         if checking_msg_id is not None:
             try:

@@ -522,6 +522,15 @@ class UserbotRelay:
             )
         except Exception as e:  # noqa: BLE001
             log.exception("review failed for relayed application: %s", e)
+            try:
+                await self.send_message_safe(
+                    chat_id,
+                    f"❌ I crashed while reviewing this batch: `{e}`. "
+                    "Please re-send and ping me if it keeps happening.",
+                    reply_to=anchor.id,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _handle_correction(
         self,
