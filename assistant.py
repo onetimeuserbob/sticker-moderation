@@ -274,14 +274,30 @@ class ModeratorAssistant:
                 cid = int(args.get("chat_id"))
             except Exception:  # noqa: BLE001
                 return "ERROR: chat_id must be an integer."
+            # Always remove from allowlist first so even if the leave call
+            # fails we stop processing this chat's messages immediately.
+            self.review_bot.allowlist.remove(cid)
+            if not (self.userbot and self.userbot.client):
+                log.warning(
+                    "assistant leave_chat: userbot not available; "
+                    "removed chat %s from allowlist only", cid
+                )
+                return (
+                    f"Removed chat {cid} from allowlist. Userbot is offline "
+                    "so I couldn't actually leave the chat — do that "
+                    "manually in Telegram."
+                )
             try:
-                if self.userbot and self.userbot.client:
-                    await self.userbot.client.delete_dialog(cid)
-                self.review_bot.allowlist.remove(cid)
+                await self.userbot.client.delete_dialog(cid)
                 log.info("assistant left chat %s", cid)
                 return f"Left chat {cid} and removed from allowlist."
             except Exception as e:  # noqa: BLE001
-                return f"Failed to leave: {e}"
+                log.exception("delete_dialog failed for chat %s: %s", cid, e)
+                return (
+                    f"Removed chat {cid} from allowlist but couldn't "
+                    f"actually leave it ({type(e).__name__}: {e}). "
+                    "You may need to leave manually in Telegram."
+                )
 
         return f"ERROR: unknown tool {name!r}"
 

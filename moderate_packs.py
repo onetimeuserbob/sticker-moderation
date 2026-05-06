@@ -714,18 +714,36 @@ def _claude_one_call(
     cfg: Config,
     client: "Anthropic | None",
     batch_label: str = "",
+    prompt_text: str | None = None,
 ) -> dict:
-    """One Claude moderation call. Used directly OR by the batched wrapper."""
+    """One Claude moderation call. Used directly OR by the batched wrapper.
+
+    If ``prompt_text`` is provided it's used verbatim and ``title`` /
+    ``description`` are ignored — the caller is responsible for having
+    already substituted them in. This is the safe path for callers who
+    want to inject extra rules into the prompt body without risking
+    ``str.format()`` choking on stray ``{...}`` in user-generated text.
+
+    If ``prompt_text`` is None we fall back to the legacy behaviour:
+    ``CLAUDE_PROMPT.format(title=..., description=...)``.
+    """
     if client is None:
         return _claude_default_red("anthropic SDK not configured")
+
+    if prompt_text is not None:
+        body = prompt_text + (
+            f"\n\n(Reviewing batch: {batch_label})" if batch_label else ""
+        )
+    else:
+        body = CLAUDE_PROMPT.format(
+            title=title or "(none)",
+            description=description or "(none)",
+        ) + (f"\n\n(Reviewing batch: {batch_label})" if batch_label else "")
 
     content: list[dict[str, Any]] = [
         {
             "type": "text",
-            "text": CLAUDE_PROMPT.format(
-                title=title or "(none)",
-                description=description or "(none)",
-            ) + (f"\n\n(Reviewing batch: {batch_label})" if batch_label else ""),
+            "text": body,
         }
     ]
     for url in image_urls:
@@ -787,16 +805,24 @@ def claude_pack_review(
     local_images: list[Path],
     cfg: Config,
     client: "Anthropic | None",
+    prompt_text: str | None = None,
 ) -> dict:
     """Review a pack, batching stickers to ensure ALL get inspected.
 
     Marketing images (logo+cover URLs) ride along with the first batch.
     Each subsequent batch is a fresh Claude call with later sticker
     thumbnails. Worst-case verdict wins; concerns are unioned.
+
+    If ``prompt_text`` is supplied it's threaded into every batch call
+    verbatim; ``title`` / ``description`` are then only used by the
+    caller's substitution and ignored here. See ``_claude_one_call``.
     """
     batch = max(cfg.claude_batch_size, 4)
     if len(local_images) <= batch:
-        return _claude_one_call(title, description, image_urls, local_images, cfg, client)
+        return _claude_one_call(
+            title, description, image_urls, local_images, cfg, client,
+            prompt_text=prompt_text,
+        )
 
     chunks: list[tuple[list[str], list[Path], str]] = []
     total = len(local_images)
@@ -809,7 +835,11 @@ def claude_pack_review(
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as pool:
         futures = [
-            pool.submit(_claude_one_call, title, description, urls, locs, cfg, client, label)
+            pool.submit(
+                _claude_one_call,
+                title, description, urls, locs, cfg, client, label,
+                prompt_text,
+            )
             for urls, locs, label in chunks
         ]
         for f in as_completed(futures):

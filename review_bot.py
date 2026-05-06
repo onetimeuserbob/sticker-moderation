@@ -378,14 +378,22 @@ class ReviewBot:
         self.started_at: float = time.time()
         self.reviews_served: int = 0  # incremented per posted verdict
         # Track verdict messages we posted so we can recognize replies as
-        # disagreement signals: posted_msg_id -> {original_msg_id, pack_url, verdict, reasoning, transport}.
+        # disagreement signals: "chat_id:msg_id" -> {original_msg_id, pack_url, verdict, reasoning, transport}.
+        #
+        # Composite key is important: Telegram message IDs are per-chat,
+        # not globally unique, so two chats can both have e.g. msg_id 42.
+        # Keying on msg_id alone meant verdicts silently overwrote each
+        # other across chats and the disagreement-learning path picked
+        # the wrong record.
+        #
         # PERSISTED to /data so a redeploy doesn't break the learning loop
-        # for verdicts posted in the previous process.
+        # for verdicts posted in the previous process. Old (msg_id-only)
+        # entries on disk are migrated forward at load time.
         self._verdict_index_path: Path = Path(
             os.getenv("VERDICT_INDEX_PATH",
                       str(bot_cfg.allowlist_path.parent / "verdict_index.json"))
         )
-        self.verdict_index: dict[int, dict] = self._load_verdict_index()
+        self.verdict_index: dict[str, dict] = self._load_verdict_index()
 
         # Persisted allowlist of group chats the owner has personally added
         # the bot to. The owner's DM chat is always allowed implicitly.
@@ -398,22 +406,50 @@ class ReviewBot:
 
     # ---------- verdict index persistence ----------
 
-    def _load_verdict_index(self) -> dict[int, dict]:
+    @staticmethod
+    def _vk(chat_id: int, msg_id: int) -> str:
+        """Compose a verdict_index key. Stringly-typed so it round-trips
+        through JSON without an int/tuple migration."""
+        return f"{int(chat_id)}:{int(msg_id)}"
+
+    def _load_verdict_index(self) -> dict[str, dict]:
         try:
-            if self._verdict_index_path.exists():
-                raw = json.loads(self._verdict_index_path.read_text())
-                return {int(k): v for k, v in raw.items()}
+            if not self._verdict_index_path.exists():
+                return {}
+            raw = json.loads(self._verdict_index_path.read_text())
         except Exception as e:  # noqa: BLE001
             log.warning("could not load verdict_index from %s: %s",
                         self._verdict_index_path, e)
-        return {}
+            return {}
+        out: dict[str, dict] = {}
+        migrated = 0
+        for k, v in raw.items():
+            if ":" in str(k):
+                out[str(k)] = v
+                continue
+            # Old-format entry (msg_id-only). Try to upgrade using
+            # chat_id stored in the value; if that's missing the entry
+            # is unsalvageable and we drop it (it would have collided
+            # under the old scheme too).
+            try:
+                msg_id = int(k)
+            except (TypeError, ValueError):
+                continue
+            chat_id = v.get("chat_id")
+            if chat_id is None:
+                continue
+            out[self._vk(chat_id, msg_id)] = v
+            migrated += 1
+        if migrated:
+            log.info("verdict_index: migrated %d old-format entries", migrated)
+        return out
 
     def _save_verdict_index(self) -> None:
         try:
             self._verdict_index_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._verdict_index_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(
-                {str(k): v for k, v in self.verdict_index.items()},
+                self.verdict_index,
                 ensure_ascii=False,
             ))
             tmp.replace(self._verdict_index_path)
@@ -847,7 +883,7 @@ class ReviewBot:
             msg.reply_to_message
             and msg.reply_to_message.from_user
             and msg.reply_to_message.from_user.is_bot
-            and msg.reply_to_message.message_id in self.verdict_index
+            and self._vk(msg.chat_id, msg.reply_to_message.message_id) in self.verdict_index
         ):
             await self._handle_disagreement(msg)
             return
@@ -1120,9 +1156,11 @@ class ReviewBot:
 
         self.reviews_served += 1
         if sent_msg_id is not None:
-            self.verdict_index[sent_msg_id] = {
+            key = self._vk(chat_id, sent_msg_id)
+            self.verdict_index[key] = {
                 "original_message_id": anchor_message_id,
                 "chat_id": chat_id,
+                "message_id": sent_msg_id,
                 "transport": "userbot" if use_userbot else "ptb",
                 "pack_url": pack_url,
                 "title": title,
@@ -1131,13 +1169,21 @@ class ReviewBot:
                 "sticker_meta": sticker_meta,
                 "ts": time.time(),
             }
+            # Age-based prune: keep the 400 newest entries, drop the rest.
+            # (Previously sorted by key — which under the new scheme is a
+            # "chat:msg" string and under the old scheme sorted by smallest
+            # numeric msg_id, neither of which is "oldest first".)
             if len(self.verdict_index) > 500:
-                for old_id in sorted(self.verdict_index.keys())[:100]:
-                    self.verdict_index.pop(old_id, None)
+                ordered = sorted(
+                    self.verdict_index.items(),
+                    key=lambda kv: kv[1].get("ts", 0),
+                    reverse=True,
+                )
+                self.verdict_index = dict(ordered[:400])
             self._save_verdict_index()
             log.info(
-                "verdict indexed: msg_id=%s chat=%s transport=%s (total=%d)",
-                sent_msg_id, chat_id,
+                "verdict indexed: chat=%s msg_id=%s transport=%s (total=%d)",
+                chat_id, sent_msg_id,
                 "userbot" if use_userbot else "ptb",
                 len(self.verdict_index),
             )
@@ -1154,25 +1200,42 @@ class ReviewBot:
     ) -> dict:
         """Run Claude with the live prompt = base + active amendments.
 
-        We monkey-patch moderate_packs.CLAUDE_PROMPT briefly because
-        _claude_one_call references it by name; this keeps us in lockstep
-        with the offline pipeline's exact behavior.
+        Earlier this monkey-patched ``moderate_packs.CLAUDE_PROMPT`` so
+        the downstream ``_claude_one_call`` would pick up the new value
+        when it called ``str.format()`` on it. That had two real bugs:
+
+        * Any amendment text containing a stray ``{word}`` (Claude
+          generates these) would crash ``.format()`` with KeyError on
+          every subsequent review.
+        * Two reviews running concurrently could race on the module
+          global — one thread restores the original prompt before the
+          other has formatted it, silently dropping every amendment
+          from that second review's verdict.
+
+        Fix: build the substituted prompt locally with ``str.replace``
+        (which doesn't choke on braces), append amendments, and pass
+        the finished body to ``claude_pack_review`` via its new
+        ``prompt_text`` kwarg. No more module-global mutation.
         """
         import moderate_packs as mp
 
-        original = mp.CLAUDE_PROMPT
-        try:
-            mp.CLAUDE_PROMPT = original + (amendments_block or "")
-            return mp.claude_pack_review(
-                title=title,
-                description=description,
-                image_urls=[],
-                local_images=marketing_images + sticker_paths,
-                cfg=self.model_cfg,
-                client=self.claude,
-            )
-        finally:
-            mp.CLAUDE_PROMPT = original
+        body = (
+            mp.CLAUDE_PROMPT
+            .replace("{title}", title or "(none)")
+            .replace("{description}", description or "(none)")
+        )
+        if amendments_block:
+            body = body + amendments_block
+
+        return mp.claude_pack_review(
+            title=title,
+            description=description,
+            image_urls=[],
+            local_images=marketing_images + sticker_paths,
+            cfg=self.model_cfg,
+            client=self.claude,
+            prompt_text=body,
+        )
 
     # ---------- photo download ----------
 
@@ -1304,7 +1367,7 @@ class ReviewBot:
 
     async def _handle_disagreement(self, msg: Message) -> None:
         bot_msg = msg.reply_to_message
-        record = self.verdict_index.get(bot_msg.message_id)
+        record = self.verdict_index.get(self._vk(msg.chat_id, bot_msg.message_id))
         if not record:
             return
         user = msg.from_user

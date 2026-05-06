@@ -29,9 +29,11 @@ from typing import TYPE_CHECKING
 
 from telethon import TelegramClient, events
 from telethon.errors import RPCError
+from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import (
     MessageEntityMention,
     MessageEntityMentionName,
+    SendMessageTypingAction,
 )
 
 from assistant import ModeratorAssistant
@@ -196,13 +198,24 @@ class UserbotRelay:
             log.warning("telethon delete_message failed: %s", e)
 
     async def send_typing(self, chat_id: int) -> None:
+        """Show "Moderator is typing..." in the chat for ~5 seconds.
+
+        We used to use ``async with self.client.action(chat, "typing"): pass``
+        — but the context manager cancels the indicator on ``__aexit__``,
+        so ``pass`` made it a no-op (typing fired and was cancelled within
+        microseconds). Send the underlying request directly instead so
+        the indicator actually lasts until Telegram's natural ~5s expiry,
+        which is roughly how long Claude takes to respond anyway.
+        """
         if self.client is None:
             return
         try:
-            async with self.client.action(chat_id, "typing"):
-                pass
-        except Exception:  # noqa: BLE001
-            pass
+            await self.client(SetTypingRequest(
+                peer=chat_id,
+                action=SendMessageTypingAction(),
+            ))
+        except Exception as e:  # noqa: BLE001
+            log.debug("send_typing failed for chat %s: %s", chat_id, e)
 
     # ---------- chat membership tracking (auto-whitelist) ----------
 
@@ -283,16 +296,20 @@ class UserbotRelay:
     async def _reply_to_me_reason(self, msg) -> str | None:
         """Return tag if ``msg`` is a reply to a message Moderator authored.
 
-        Two paths: cheap lookup in our verdict_index, or fetching the
-        replied-to message and comparing sender_id. Some forum-style
-        supergroups put ``reply_to_top_id`` (thread root) in addition to
+        Two paths: cheap lookup in our verdict_index (keyed by
+        ``chat_id:msg_id``), or fetching the replied-to message and
+        comparing sender_id. Some forum-style supergroups put
+        ``reply_to_top_id`` (thread root) in addition to
         ``reply_to_msg_id`` — we always use the immediate parent.
         """
         reply_to = getattr(msg, "reply_to", None)
         replied_to_id = getattr(reply_to, "reply_to_msg_id", None) if reply_to else None
         if not replied_to_id:
             return None
-        v = self.review_bot.verdict_index.get(replied_to_id)
+        chat_id = self._normalize_chat_id(msg.chat_id)
+        v = self.review_bot.verdict_index.get(
+            self.review_bot._vk(chat_id, replied_to_id)
+        )
         if v and v.get("transport") == "userbot":
             return "verdict-index"
         try:
@@ -329,7 +346,8 @@ class UserbotRelay:
         reply_to = getattr(msg, "reply_to", None)
         replied_to_id = getattr(reply_to, "reply_to_msg_id", None) if reply_to else None
         if replied_to_id and sender_id == self.review_bot.bot_cfg.owner_user_id:
-            if replied_to_id in self.review_bot.verdict_index:
+            verdict_key = self.review_bot._vk(chat_id, replied_to_id)
+            if verdict_key in self.review_bot.verdict_index:
                 user_text = (msg.message or "").strip()
                 if user_text:
                     log.info(
@@ -339,7 +357,7 @@ class UserbotRelay:
                     await self._handle_correction(
                         chat_id=chat_id,
                         anchor_msg_id=msg.id,
-                        record=self.review_bot.verdict_index[replied_to_id],
+                        record=self.review_bot.verdict_index[verdict_key],
                         user_text=user_text,
                     )
                     return
