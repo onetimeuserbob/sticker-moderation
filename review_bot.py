@@ -38,7 +38,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 from telegram import Update, Message, InputMediaPhoto
@@ -1571,31 +1571,60 @@ Output ONLY a JSON object:
 
 # ---------- helpers ----------
 
-def _start_health_server(port: int) -> None:
+def _start_health_server(
+    port: int,
+    probe: "Callable[[], tuple[bool, str]] | None" = None,
+) -> None:
     """Tiny stdlib HTTP server in a daemon thread for deploy health checks.
 
-    fly.io's "Deploy from GitHub" wizard adds a health check on the
-    primary HTTP port even when fly.toml declares no http_service. The
-    bot itself only speaks long-poll HTTPS *outbound*, so without this
-    the deploy hangs at "timeout trying to get your app". Returns 200
-    "ok" on any path; we don't expose any sensitive info.
+    Two endpoints:
+      * ``/`` — always 200 "ok". Used by Fly's TCP-on-connect deploy probe
+        which we can't lose without the deploy timing out.
+      * ``/health`` (and ``/healthz``) — 200 "ok\\n<note>" if the supplied
+        ``probe`` returns ``(True, note)``; 503 with the failure reason
+        otherwise. Wire this into Fly's ``[[http_service.checks]]`` block
+        so the machine is auto-restarted when the userbot is silently
+        broken.
+
+    If ``probe`` is None (e.g. local dev without a userbot), ``/health``
+    behaves the same as ``/``.
     """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class _Handler(BaseHTTPRequestHandler):
-        def _send_ok(self) -> None:
-            self.send_response(200)
+        def _write(self, status: int, body: str) -> None:
+            payload = body.encode("utf-8")
+            self.send_response(status)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", "3")
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(b"ok\n")
+            self.wfile.write(payload)
+
+        def _serve_request(self, head_only: bool = False) -> None:
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path in ("/health", "/healthz"):
+                if probe is None:
+                    body, status = "ok\n", 200
+                else:
+                    try:
+                        ok, note = probe()
+                    except Exception as e:  # noqa: BLE001
+                        ok, note = False, f"probe raised: {e}"
+                    status = 200 if ok else 503
+                    body = f"{'ok' if ok else 'unhealthy'}: {note}\n"
+            else:
+                status, body = 200, "ok\n"
+            if head_only:
+                self.send_response(status)
+                self.end_headers()
+            else:
+                self._write(status, body)
 
         def do_GET(self) -> None:  # noqa: N802
-            self._send_ok()
+            self._serve_request()
 
         def do_HEAD(self) -> None:  # noqa: N802
-            self.send_response(200)
-            self.end_headers()
+            self._serve_request(head_only=True)
 
         def log_message(self, fmt: str, *args) -> None:  # silence stderr noise
             return
@@ -1714,8 +1743,13 @@ def _chunk(s: str, n: int) -> list[str]:
 
 # ---------- entrypoint ----------
 
-def build_app(bot_cfg: BotConfig, model_cfg: Config) -> Application:
-    bot = ReviewBot(bot_cfg, model_cfg)
+def build_app(
+    bot_cfg: BotConfig,
+    model_cfg: Config,
+    bot: "ReviewBot | None" = None,
+) -> Application:
+    if bot is None:
+        bot = ReviewBot(bot_cfg, model_cfg)
 
     async def _post_init(application: Application) -> None:
         bot.bot = application.bot
@@ -1783,9 +1817,19 @@ def build_app(bot_cfg: BotConfig, model_cfg: Config) -> Application:
     return app
 
 
-def _run_userbot_only(bot_cfg: BotConfig, model_cfg: Config) -> int:
+def _run_userbot_only(
+    bot_cfg: BotConfig,
+    model_cfg: Config,
+    bot: "ReviewBot | None" = None,
+) -> int:
     """Run the userbot relay without the PTB Bot at all. Used when the
-    operator has retired the @moder_sticker_bot identity."""
+    operator has retired the @moder_sticker_bot identity.
+
+    ``bot`` is optional so existing callers keep working; if supplied,
+    it's reused (so e.g. the health-probe lambda registered before this
+    call sees the same instance and its ``userbot`` attribute appears
+    in place once start() returns).
+    """
     if not (bot_cfg.userbot_api_id and bot_cfg.userbot_api_hash
             and bot_cfg.userbot_session_path.exists()):
         raise SystemExit(
@@ -1793,7 +1837,8 @@ def _run_userbot_only(bot_cfg: BotConfig, model_cfg: Config) -> int:
             "Either re-enable the bot or fix TELEGRAM_API_ID / TELEGRAM_API_HASH "
             "/ USERBOT_SESSION_PATH."
         )
-    bot = ReviewBot(bot_cfg, model_cfg)
+    if bot is None:
+        bot = ReviewBot(bot_cfg, model_cfg)
     from userbot import UserbotRelay
 
     async def _go() -> None:
@@ -1818,11 +1863,25 @@ def main() -> int:
     )
     bot_cfg = BotConfig.from_env()
     model_cfg = Config.from_env()
+
+    # Construct the bot up front so the health probe can reference it
+    # before the userbot has actually started (avoiding a chicken/egg
+    # ordering issue when fly's first probe arrives).
+    bot = ReviewBot(bot_cfg, model_cfg)
+
+    def _health_probe() -> tuple[bool, str]:
+        """True only if the userbot is fully connected. During the
+        startup window before userbot.start() returns we report healthy
+        — Fly's grace_period covers cold starts."""
+        if bot.userbot is None:
+            return True, "userbot starting"
+        return bot.userbot.is_healthy()
+
     # Fly.io / Railway / Heroku expose $PORT and expect us to bind to it.
     # Locally there's no PORT and we skip the health server.
     port_env = os.getenv("PORT", "").strip()
     if port_env.isdigit():
-        _start_health_server(int(port_env))
+        _start_health_server(int(port_env), probe=_health_probe)
 
     # If BOT_ENABLED is explicitly false, run a userbot-only process: no
     # @moder_sticker_bot polling, no PTB. Useful once the team has fully
@@ -1832,9 +1891,9 @@ def main() -> int:
                    not in ("0", "false", "no", "off"))
     if not bot_enabled:
         log.info("BOT_ENABLED=false → running userbot-only mode")
-        return _run_userbot_only(bot_cfg, model_cfg)
+        return _run_userbot_only(bot_cfg, model_cfg, bot=bot)
 
-    app = build_app(bot_cfg, model_cfg)
+    app = build_app(bot_cfg, model_cfg, bot=bot)
     log.info(
         "review bot starting; source=@%s; owner=%s; allowlist_seed=%s; allowlist_path=%s",
         bot_cfg.source_bot_username,

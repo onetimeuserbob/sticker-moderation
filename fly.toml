@@ -1,10 +1,14 @@
 # fly.io app configuration for the Sticker Pad review bot.
 #
-# The bot itself uses Telegram long-polling (outbound HTTPS only). We
-# bind a tiny health-check HTTP server on $PORT alongside it so fly's
-# deploy probes succeed. The machine stays running 24/7 (no auto-stop)
-# because long-poll bots don't generate inbound traffic that would keep
-# them awake.
+# We're a Telegram bot (outbound MTProto + Bot-API HTTPS only). We bind
+# a tiny HTTP server on $PORT for two reasons:
+#   1. so Fly's deploy probe can confirm the machine is up
+#   2. so Fly can actively probe /health and restart the machine when
+#      the userbot dispatcher silently dies (which has happened — bot
+#      stays "alive" but stops receiving Telegram updates)
+#
+# /health returns 503 when the userbot is disconnected or hasn't seen
+# an event in 30 minutes. See _start_health_server in review_bot.py.
 #
 # After changes here:
 #   fly deploy
@@ -30,6 +34,26 @@ primary_region = 'ams'
   auto_start_machines = true
   min_machines_running = 1
   processes = ['app']
+
+  # Active health-check: Fly probes /health periodically and restarts
+  # the machine if it goes unhealthy. Grace period is generous so cold
+  # starts (Telethon connect + dialog prefetch + replay) don't cause a
+  # crash-loop, but once we're past startup an unhealthy state is
+  # caught within ~minute.
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '120s'
+    method = 'GET'
+    path = '/health'
+
+# Restart on ANY exit, not just non-zero. Some failure modes (an
+# uncaught exception in a background task) can leave the process
+# wedged but technically alive; this together with the active health
+# check ensures we always recover.
+[[restart]]
+  policy = 'always'
+  retries = 10
 
 [[vm]]
   size = 'shared-cpu-1x'

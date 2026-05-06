@@ -92,6 +92,10 @@ class UserbotRelay:
         self._me_username: str | None = None
         self._bot_id: int | None = None  # the moderator bot's id
         self.assistant = ModeratorAssistant(review_bot, self)
+        # Liveness signals consumed by the health endpoint and heartbeat.
+        self.started_at: float = time.time()
+        self.last_event_at: float = time.time()
+        self._heartbeat_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         session = str(self.bot_cfg.userbot_session_path)
@@ -140,15 +144,175 @@ class UserbotRelay:
             log.info("userbot caught up on pending updates")
         except Exception as e:  # noqa: BLE001
             log.warning("catch_up failed: %s", e)
+
+        # Active replay: walk recent history of every whitelisted chat
+        # and process any source-bot applications we don't yet have a
+        # verdict for. This is the safety net that makes "won't miss
+        # an application" actually true: catch_up alone is at the mercy
+        # of Telegram's update-difference window AND (in our experience)
+        # doesn't reliably re-dispatch historical messages through
+        # registered NewMessage handlers.
+        try:
+            await self._replay_missed_apps()
+        except Exception as e:  # noqa: BLE001
+            log.warning("startup replay failed: %s", e)
+
+        # Heartbeat task: periodically log that we're alive. If these
+        # stop appearing in logs, the dispatcher loop is dead and Fly's
+        # health probe will catch it within the next minute.
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         # Telethon now dispatches events on the connected client; we
         # return and let the caller hold the asyncio loop open.
 
     async def stop(self) -> None:
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
         if self.client is not None:
             try:
                 await self.client.disconnect()
             except Exception:  # noqa: BLE001
                 pass
+
+    # ---------- Liveness / health ----------
+
+    def is_healthy(self) -> tuple[bool, str]:
+        """Used by the HTTP health endpoint and the heartbeat log.
+
+        Healthy iff:
+          1. the Telethon client exists and is_connected() is True, AND
+          2. we've received at least one event in the last EVENT_GAP_MAX
+             seconds, OR we've been up for less than that gap (grace
+             window for cold starts in idle chats).
+        """
+        EVENT_GAP_MAX = 30 * 60  # 30 min — generous for low-traffic chat
+        if self.client is None:
+            return False, "client not initialised"
+        if not self.client.is_connected():
+            return False, "telethon client disconnected"
+        gap = time.time() - max(self.last_event_at, self.started_at)
+        if gap > EVENT_GAP_MAX:
+            return False, f"no events for {int(gap)}s (>{EVENT_GAP_MAX}s)"
+        return True, "ok"
+
+    async def _heartbeat_loop(self) -> None:
+        """Log a one-line liveness signal every 5 minutes so the dispatcher
+        going silent is visible in the log stream."""
+        try:
+            while True:
+                await asyncio.sleep(300)
+                ok, why = self.is_healthy()
+                gap = int(time.time() - self.last_event_at)
+                log.info(
+                    "userbot heartbeat: connected=%s healthy=%s last_event=%ds_ago note=%s",
+                    self.client.is_connected() if self.client else False,
+                    ok, gap, why,
+                )
+        except asyncio.CancelledError:
+            return
+
+    # ---------- Startup replay of missed applications ----------
+
+    async def _replay_missed_apps(self) -> None:
+        """For each whitelisted chat, walk recent history and process
+        any source-bot application we don't already have a verdict for.
+
+        Bounded by REPLAY_AGE_MAX (24 h) and REPLAY_LIMIT (200 messages
+        per chat) so we never replay ancient history. Idempotent: relies
+        on verdict_index to skip applications already reviewed.
+
+        Media-group anchoring: messages are fed through the same
+        ``_buffer()`` debouncer as live traffic, so a multi-part
+        application (logo + cover + text-with-link) coalesces into one
+        review with the same anchor message id it would have had live —
+        which means the verdict_index check is consistent across
+        replays.
+        """
+        REPLAY_AGE_MAX = 24 * 3600
+        REPLAY_LIMIT = 200
+        if self.client is None:
+            return
+        cutoff_ts = time.time() - REPLAY_AGE_MAX
+
+        # Set of (chat_id, anchor_msg_id) we've already verdict'd, used
+        # to skip messages whose batch was already reviewed. We can only
+        # match against the anchor (the first / lowest-id message in
+        # the batch) — but iter_messages returns oldest-first when
+        # reversed, and our buffer always anchors on min(id), so the
+        # check is consistent.
+        already = {
+            (v.get("chat_id"), v.get("original_message_id"))
+            for v in self.review_bot.verdict_index.values()
+        }
+
+        chats = self.review_bot.allowlist.all()
+        log.info("replay: scanning %d whitelisted chat(s) for missed apps", len(chats))
+        for entry in chats:
+            chat_id = entry.get("chat_id")
+            if chat_id is None:
+                continue
+            try:
+                entity = await self.client.get_entity(chat_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("replay: get_entity(%s) failed: %s — skipping",
+                            chat_id, e)
+                continue
+
+            candidates: list = []
+            try:
+                async for m in self.client.iter_messages(entity, limit=REPLAY_LIMIT):
+                    # iter_messages yields newest-first; we exit when
+                    # we cross the age cutoff.
+                    if m.date and m.date.timestamp() < cutoff_ts:
+                        break
+                    s_id = m.sender_id
+                    if (
+                        not self.bot_cfg.source_bot_ids
+                        or s_id not in self.bot_cfg.source_bot_ids
+                    ):
+                        continue
+                    looks_like_app = bool(
+                        m.photo or m.grouped_id
+                        or _find_pack_url_in_telethon_msg(m)
+                    )
+                    if not looks_like_app:
+                        continue
+                    candidates.append(m)
+            except Exception as e:  # noqa: BLE001
+                log.warning("replay: iter_messages failed for chat %s: %s",
+                            chat_id, e)
+                continue
+
+            if not candidates:
+                log.info("replay: chat=%s — no app-shaped source-bot messages in window", chat_id)
+                continue
+
+            # Group by grouped_id (None grouped_id = standalone). For
+            # each group, anchor = min(id). Skip groups whose anchor is
+            # already in verdict_index.
+            groups: dict[object, list] = {}
+            for m in candidates:
+                key = m.grouped_id if m.grouped_id else f"solo-{m.id}"
+                groups.setdefault(key, []).append(m)
+
+            replayed = 0
+            for key, msgs in groups.items():
+                anchor_id = min(m.id for m in msgs)
+                if (chat_id, anchor_id) in already:
+                    continue
+                log.info(
+                    "replay: re-injecting missed batch chat=%s anchor=%s parts=%d",
+                    chat_id, anchor_id, len(msgs),
+                )
+                # Feed oldest-first into the debouncer; buffer will
+                # combine them (3 s debounce) and _fire will run.
+                for m in sorted(msgs, key=lambda x: x.id):
+                    await self._buffer(chat_id, m)
+                replayed += 1
+
+            log.info(
+                "replay: chat=%s — %d candidate batch(es), %d replayed, %d already done",
+                chat_id, len(groups), replayed, len(groups) - replayed,
+            )
 
     # ---------- Outgoing primitives (used by ReviewBot.run_review) ----------
     # We expose send / delete / typing here so the moderation verdict can be
@@ -342,6 +506,8 @@ class UserbotRelay:
     async def _on_new_message(self, event) -> None:
         msg = event.message
         chat_id = self._normalize_chat_id(event.chat_id)
+        # Liveness ping: any inbound event resets the watchdog.
+        self.last_event_at = time.time()
 
         # Top-of-handler trace so EVERY inbound dispatch is visible in
         # logs. Cheap, single line per event. If we ever go silent again
