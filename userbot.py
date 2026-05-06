@@ -200,6 +200,30 @@ class UserbotRelay:
             and sender_id == self.review_bot.bot_cfg.owner_user_id
         )
 
+        # Disagreement learning: did the owner reply to a verdict we
+        # posted via the userbot? verdict_index is keyed by Telethon
+        # message id for userbot-posted verdicts.
+        reply_to = getattr(msg, "reply_to", None)
+        replied_to_id = getattr(reply_to, "reply_to_msg_id", None) if reply_to else None
+        if (
+            replied_to_id
+            and sender_id == self.review_bot.bot_cfg.owner_user_id
+            and replied_to_id in self.review_bot.verdict_index
+        ):
+            user_text = (msg.message or "").strip()
+            if user_text:
+                log.info(
+                    "userbot saw correction reply: chat=%s replied_to=%s text_len=%d",
+                    chat_id, replied_to_id, len(user_text),
+                )
+                await self._handle_correction(
+                    chat_id=chat_id,
+                    anchor_msg_id=msg.id,
+                    record=self.review_bot.verdict_index[replied_to_id],
+                    user_text=user_text,
+                )
+                return
+
         if is_dm_from_owner:
             # Owner is testing via DM with the Moderator account. Always
             # process; skip the chat-allowlist + is-bot gates below.
@@ -302,6 +326,29 @@ class UserbotRelay:
             )
         except Exception as e:  # noqa: BLE001
             log.exception("review failed for relayed application: %s", e)
+
+    async def _handle_correction(
+        self,
+        *,
+        chat_id: int,
+        anchor_msg_id: int,
+        record: dict,
+        user_text: str,
+    ) -> None:
+        """Owner replied to one of our verdicts with a correction. Run the
+        learning pipeline (Claude rule synthesis) and post the result."""
+        await self.send_typing(chat_id)
+        try:
+            reply = await self.review_bot.process_correction(record, user_text)
+        except Exception as e:  # noqa: BLE001
+            log.exception("process_correction failed: %s", e)
+            await self.send_message_safe(
+                chat_id,
+                "Tried to learn from your reply but Claude errored. Try again.",
+                reply_to=anchor_msg_id,
+            )
+            return
+        await self.send_message_safe(chat_id, reply, reply_to=anchor_msg_id)
 
     async def _download_photos(self, msgs, chat_id: int) -> list[Path]:
         out: list[Path] = []

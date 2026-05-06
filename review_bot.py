@@ -1252,16 +1252,25 @@ class ReviewBot:
         except Exception:  # noqa: BLE001
             pass
 
-        result = await asyncio.to_thread(self._claude_learn_from_correction, record, user_text)
+        reply = await self.process_correction(record, user_text)
+        await _safe_reply(msg, reply, parse_mode=ParseMode.MARKDOWN)
 
+    async def process_correction(self, record: dict, user_text: str) -> str:
+        """Run Claude on a correction, mutate the ruleset accordingly, and
+        return a Markdown reply describing what changed. Transport-agnostic
+        so both PTB (group/DM with bot) and Telethon (DM with Moderator)
+        can use it."""
+        result = await asyncio.to_thread(
+            self._claude_learn_from_correction, record, user_text
+        )
         decision = result.get("decision", "noop")
+        reason = (result.get("reason") or "").strip()
+
         if decision == "noop":
-            await msg.reply_text(
+            return (
                 "👌 Got it — recorded your view. "
-                f"I won't change the ruleset because: _{result.get('reason', '').strip()}_",
-                parse_mode=ParseMode.MARKDOWN,
+                f"I won't change the ruleset because: _{reason}_"
             )
-            return
 
         text = (result.get("text") or "").strip()
         category = (result.get("category") or "NOTE").upper()
@@ -1270,22 +1279,18 @@ class ReviewBot:
             existing_id = int(result["amend_id"])
             updated = self.rules.update(existing_id, text=text, category=category)
             if updated:
-                await msg.reply_text(
+                return (
                     f"♻️ Learned: amended rule `#{updated.id}` ({updated.category}).\n"
-                    f"{updated.text}\n\n_{result.get('reason', '').strip()}_",
-                    parse_mode=ParseMode.MARKDOWN,
+                    f"{updated.text}\n\n_{reason}_"
                 )
-                return
         if decision == "remove" and result.get("amend_id"):
             existing_id = int(result["amend_id"])
             removed = self.rules.deactivate(existing_id)
             if removed:
-                await msg.reply_text(
+                return (
                     f"🗑 Learned: removed rule `#{removed.id}` ({removed.category}): {removed.text}\n"
-                    f"_{result.get('reason', '').strip()}_",
-                    parse_mode=ParseMode.MARKDOWN,
+                    f"_{reason}_"
                 )
-                return
 
         # default: add
         amendment = self.rules.add(
@@ -1294,10 +1299,9 @@ class ReviewBot:
             source="learned",
             context=record.get("pack_url", "")[:200],
         )
-        await msg.reply_text(
-            f"✅ Learned: added rule `#{amendment.id}` ({amendment.category}).\n{amendment.text}\n\n"
-            f"_{result.get('reason', '').strip()}_",
-            parse_mode=ParseMode.MARKDOWN,
+        return (
+            f"✅ Learned: added rule `#{amendment.id}` ({amendment.category}).\n"
+            f"{amendment.text}\n\n_{reason}_"
         )
 
     # ---------- Claude helpers (rule synthesis / learning) ----------
