@@ -378,8 +378,14 @@ class ReviewBot:
         self.started_at: float = time.time()
         self.reviews_served: int = 0  # incremented per posted verdict
         # Track verdict messages we posted so we can recognize replies as
-        # disagreement signals: bot_message_id -> {original_msg_id, pack_url, verdict, reasoning}
-        self.verdict_index: dict[int, dict] = {}
+        # disagreement signals: posted_msg_id -> {original_msg_id, pack_url, verdict, reasoning, transport}.
+        # PERSISTED to /data so a redeploy doesn't break the learning loop
+        # for verdicts posted in the previous process.
+        self._verdict_index_path: Path = Path(
+            os.getenv("VERDICT_INDEX_PATH",
+                      str(bot_cfg.allowlist_path.parent / "verdict_index.json"))
+        )
+        self.verdict_index: dict[int, dict] = self._load_verdict_index()
 
         # Persisted allowlist of group chats the owner has personally added
         # the bot to. The owner's DM chat is always allowed implicitly.
@@ -389,6 +395,30 @@ class ReviewBot:
         self._dm_warned: set[int] = set()
 
         bot_cfg.tg_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---------- verdict index persistence ----------
+
+    def _load_verdict_index(self) -> dict[int, dict]:
+        try:
+            if self._verdict_index_path.exists():
+                raw = json.loads(self._verdict_index_path.read_text())
+                return {int(k): v for k, v in raw.items()}
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not load verdict_index from %s: %s",
+                        self._verdict_index_path, e)
+        return {}
+
+    def _save_verdict_index(self) -> None:
+        try:
+            self._verdict_index_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._verdict_index_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                {str(k): v for k, v in self.verdict_index.items()},
+                ensure_ascii=False,
+            ))
+            tmp.replace(self._verdict_index_path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not persist verdict_index: %s", e)
 
     # ---------- chat/owner gating ----------
 
@@ -1051,6 +1081,8 @@ class ReviewBot:
         if sent_msg_id is not None:
             self.verdict_index[sent_msg_id] = {
                 "original_message_id": anchor_message_id,
+                "chat_id": chat_id,
+                "transport": "userbot" if use_userbot else "ptb",
                 "pack_url": pack_url,
                 "title": title,
                 "description": description,
@@ -1061,6 +1093,13 @@ class ReviewBot:
             if len(self.verdict_index) > 500:
                 for old_id in sorted(self.verdict_index.keys())[:100]:
                     self.verdict_index.pop(old_id, None)
+            self._save_verdict_index()
+            log.info(
+                "verdict indexed: msg_id=%s chat=%s transport=%s (total=%d)",
+                sent_msg_id, chat_id,
+                "userbot" if use_userbot else "ptb",
+                len(self.verdict_index),
+            )
 
     # ---------- Claude wrapper that injects amendments ----------
 
