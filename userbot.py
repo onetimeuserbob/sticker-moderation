@@ -184,10 +184,6 @@ class UserbotRelay:
         msg = event.message
         chat_id = self._normalize_chat_id(event.chat_id)
 
-        # Only process chats the owner has whitelisted via the bot.
-        if not self.review_bot.allowlist.contains(chat_id):
-            return
-
         sender = await event.get_sender()
         sender_id = getattr(sender, "id", None)
         if sender_id is None:
@@ -199,18 +195,37 @@ class UserbotRelay:
         if self._bot_id and sender_id == self._bot_id:
             return
 
-        # Decide whether this looks like an application from a source bot.
-        # Strategy: only relay messages from BOT accounts that are in
-        # bot_cfg.source_bot_ids OR — if that set is empty — from any
-        # bot account (defensive default). PTB already sees human
-        # messages directly, so we never relay those.
+        is_dm_from_owner = (
+            event.is_private
+            and sender_id == self.review_bot.bot_cfg.owner_user_id
+        )
+
+        if is_dm_from_owner:
+            # Owner is testing via DM with the Moderator account. Always
+            # process; skip the chat-allowlist + is-bot gates below.
+            text_blob = msg.message or ""
+            pack_url = _find_pack_url_in_telethon_msg(msg)
+            looks_like_app = bool(msg.photo or msg.grouped_id or pack_url)
+            if not looks_like_app:
+                return
+            log.info(
+                "userbot saw OWNER-DM app-part: chat=%s msg_id=%s photo=%s pack_url=%r",
+                chat_id, msg.id, bool(msg.photo), pack_url,
+            )
+            await self._buffer(chat_id, msg)
+            return
+
+        # Group / supergroup path: only act in chats the owner has
+        # whitelisted via the bot, and only on messages from configured
+        # source bots (so we don't relay random human chit-chat).
+        if not self.review_bot.allowlist.contains(chat_id):
+            return
         is_bot = bool(getattr(sender, "bot", False))
         if not is_bot:
             return
         if self.bot_cfg.source_bot_ids and sender_id not in self.bot_cfg.source_bot_ids:
             return
 
-        # Look like an application part?
         text_blob = msg.message or ""
         pack_url = _find_pack_url_in_telethon_msg(msg)
         looks_like_app = bool(msg.photo or msg.grouped_id or pack_url)
