@@ -253,39 +253,56 @@ class UserbotRelay:
 
     # ---------- detection helpers ----------
 
-    def _is_mentioned(self, msg) -> bool:
-        """True if the message @-mentions Moderator (by username or by id)."""
+    def _mention_reason(self, msg) -> str | None:
+        """Return a short tag for HOW the message addressed Moderator, or
+        None if it didn't.
+
+        Order of checks:
+          1. Telegram's own ``msg.mentioned`` flag — server-side signal that
+             the current user was mentioned (works for accounts WITHOUT a
+             @username because the picker emits MessageEntityMentionName
+             carrying our user_id).
+          2. Explicit MessageEntityMentionName matching our user_id.
+          3. MessageEntityMention text "@username" if we happen to have one.
+        """
+        if getattr(msg, "mentioned", False):
+            return "tg-flag"
         if not msg.entities:
-            return False
+            return None
         text = msg.message or ""
         for ent in msg.entities:
-            if isinstance(ent, MessageEntityMentionName):
-                if ent.user_id == self._me_id:
-                    return True
-            elif isinstance(ent, MessageEntityMention) and self._me_username:
+            if isinstance(ent, MessageEntityMentionName) and ent.user_id == self._me_id:
+                return "entity-mention-name"
+            if isinstance(ent, MessageEntityMention) and self._me_username:
                 start, length = ent.offset, ent.length
                 snippet = text[start:start + length].lstrip("@").lower()
                 if snippet == self._me_username:
-                    return True
-        return False
+                    return "entity-mention-username"
+        return None
 
-    async def _is_reply_to_me(self, msg) -> bool:
-        """True if msg.reply_to points to a message Moderator authored."""
+    async def _reply_to_me_reason(self, msg) -> str | None:
+        """Return tag if ``msg`` is a reply to a message Moderator authored.
+
+        Two paths: cheap lookup in our verdict_index, or fetching the
+        replied-to message and comparing sender_id. Some forum-style
+        supergroups put ``reply_to_top_id`` (thread root) in addition to
+        ``reply_to_msg_id`` — we always use the immediate parent.
+        """
         reply_to = getattr(msg, "reply_to", None)
         replied_to_id = getattr(reply_to, "reply_to_msg_id", None) if reply_to else None
         if not replied_to_id:
-            return False
-        # Cheap check: it's a verdict we posted (we know msg_id).
-        if replied_to_id in self.review_bot.verdict_index:
-            v = self.review_bot.verdict_index[replied_to_id]
-            if v.get("transport") == "userbot":
-                return True
-        # Otherwise fetch the replied-to message and check the sender.
+            return None
+        v = self.review_bot.verdict_index.get(replied_to_id)
+        if v and v.get("transport") == "userbot":
+            return "verdict-index"
         try:
             replied = await msg.get_reply_message()
-            return bool(replied and replied.sender_id == self._me_id)
-        except Exception:  # noqa: BLE001
-            return False
+        except Exception as e:  # noqa: BLE001
+            log.debug("get_reply_message failed for msg %s: %s", msg.id, e)
+            return None
+        if replied and replied.sender_id == self._me_id:
+            return "reply-fetch"
+        return None
 
     async def _on_new_message(self, event) -> None:
         msg = event.message
@@ -369,7 +386,11 @@ class UserbotRelay:
         if not self.review_bot.allowlist.contains(chat_id):
             return
 
-        # 1) source-bot application: hand to review pipeline
+        # 1) source-bot application: hand to review pipeline.
+        # IMPORTANT: this path requires NO @-mention or reply from
+        # @sticker_bot — applications are detected purely by sender id
+        # plus the application-shape heuristics (photo / grouped media /
+        # t.me/addstickers/<slug> link).
         if sender_is_bot and (
             not self.bot_cfg.source_bot_ids
             or sender_id in self.bot_cfg.source_bot_ids
@@ -381,13 +402,32 @@ class UserbotRelay:
                 )
                 await self._buffer(chat_id, msg)
                 return
-            # bot posted something else → ignore
+            log.debug(
+                "ignoring source-bot non-app msg: chat=%s sender=%s msg_id=%s text_len=%d",
+                chat_id, sender_id, msg.id, len(text_blob),
+            )
             return
 
-        # 2) human message — only react if directly addressed to Moderator
-        addressed = self._is_mentioned(msg) or await self._is_reply_to_me(msg)
+        # 2) human (or third-party-bot) message: react ONLY if the
+        # message directly addresses Moderator. Anything else in the chat
+        # is none of our business — this is what stops random group
+        # chatter from triggering the assistant.
+        mention_tag = self._mention_reason(msg)
+        reply_tag = await self._reply_to_me_reason(msg)
+        addressed = bool(mention_tag or reply_tag)
         if not addressed:
+            log.debug(
+                "ignoring unaddressed msg: chat=%s sender=%s msg_id=%s text_len=%d "
+                "(no mention, not a reply to me)",
+                chat_id, sender_id, msg.id, len(text_blob),
+            )
             return
+        log.info(
+            "userbot addressed: chat=%s sender=%s msg_id=%s via=%s text_len=%d",
+            chat_id, sender_id, msg.id,
+            "+".join(t for t in (mention_tag, reply_tag) if t),
+            len(text_blob),
+        )
 
         # If a human pasted a pack link / photo while talking to Moderator,
         # treat it as an application too (handy for owner ad-hoc reviews).
@@ -401,10 +441,6 @@ class UserbotRelay:
 
         # Otherwise: assistant Q&A.
         if text_blob.strip():
-            log.info(
-                "userbot assistant query in chat=%s sender=%s owner=%s text_len=%d",
-                chat_id, sender_id, is_owner, len(text_blob),
-            )
             await self._handle_assistant(
                 chat_id, msg, sender_id, sender, text_blob, is_owner=is_owner
             )
