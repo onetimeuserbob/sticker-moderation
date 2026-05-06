@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY moderate_packs.py tg_ingest.py review_bot.py rules_store.py userbot.py ./
+COPY moderate_packs.py tg_ingest.py review_bot.py rules_store.py userbot.py assistant.py ./
 COPY build_review.py ./
 
 # Persisted state lives here (fly volume mount target).

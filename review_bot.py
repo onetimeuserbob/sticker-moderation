@@ -1251,7 +1251,7 @@ class ReviewBot:
             updated = self.rules.update(existing_id, text=text, category=category)
             if updated:
                 await msg.reply_text(
-                    f"♻️ Amended rule `#{updated.id}` ({updated.category}):\n{updated.text}",
+                    f"♻️ Amended amendment `#{updated.id}` ({updated.category}):\n{updated.text}",
                     parse_mode=ParseMode.MARKDOWN,
                 )
                 return
@@ -1263,7 +1263,7 @@ class ReviewBot:
             context=raw_text[:200],
         )
         await msg.reply_text(
-            f"✅ Added rule `#{amendment.id}` ({amendment.category}):\n{amendment.text}\n\n"
+            f"✅ Added amendment `#{amendment.id}` ({amendment.category}):\n{amendment.text}\n\n"
             f"_{result.get('reason', '').strip()}_",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -1323,7 +1323,7 @@ class ReviewBot:
             updated = self.rules.update(existing_id, text=text, category=category)
             if updated:
                 return (
-                    f"♻️ Learned: amended rule `#{updated.id}` ({updated.category}).\n"
+                    f"♻️ Learned: amended amendment `#{updated.id}` ({updated.category}).\n"
                     f"{updated.text}\n\n_{reason}_"
                 )
         if decision == "remove" and result.get("amend_id"):
@@ -1331,7 +1331,7 @@ class ReviewBot:
             removed = self.rules.deactivate(existing_id)
             if removed:
                 return (
-                    f"🗑 Learned: removed rule `#{removed.id}` ({removed.category}): {removed.text}\n"
+                    f"🗑 Learned: deactivated amendment `#{removed.id}` ({removed.category}): {removed.text}\n"
                     f"_{reason}_"
                 )
 
@@ -1343,7 +1343,7 @@ class ReviewBot:
             context=record.get("pack_url", "")[:200],
         )
         return (
-            f"✅ Learned: added rule `#{amendment.id}` ({amendment.category}).\n"
+            f"✅ Learned: added amendment `#{amendment.id}` ({amendment.category}).\n"
             f"{amendment.text}\n\n_{reason}_"
         )
 
@@ -1689,6 +1689,34 @@ def build_app(bot_cfg: BotConfig, model_cfg: Config) -> Application:
     return app
 
 
+def _run_userbot_only(bot_cfg: BotConfig, model_cfg: Config) -> int:
+    """Run the userbot relay without the PTB Bot at all. Used when the
+    operator has retired the @moder_sticker_bot identity."""
+    if not (bot_cfg.userbot_api_id and bot_cfg.userbot_api_hash
+            and bot_cfg.userbot_session_path.exists()):
+        raise SystemExit(
+            "BOT_ENABLED=false but userbot creds/session aren't configured. "
+            "Either re-enable the bot or fix TELEGRAM_API_ID / TELEGRAM_API_HASH "
+            "/ USERBOT_SESSION_PATH."
+        )
+    bot = ReviewBot(bot_cfg, model_cfg)
+    from userbot import UserbotRelay
+
+    async def _go() -> None:
+        bot.userbot = UserbotRelay(bot, bot_cfg)
+        await bot.userbot.start()
+        log.info(
+            "userbot-only mode active; source_bot_ids=%s; allowlist_path=%s",
+            sorted(bot_cfg.source_bot_ids) or "(none)", bot_cfg.allowlist_path,
+        )
+        # Run forever — Telethon dispatches events on its own task; we just
+        # need to keep the process alive.
+        await bot.userbot.client.run_until_disconnected()  # type: ignore[union-attr]
+
+    asyncio.run(_go())
+    return 0
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -1701,6 +1729,17 @@ def main() -> int:
     port_env = os.getenv("PORT", "").strip()
     if port_env.isdigit():
         _start_health_server(int(port_env))
+
+    # If BOT_ENABLED is explicitly false, run a userbot-only process: no
+    # @moder_sticker_bot polling, no PTB. Useful once the team has fully
+    # migrated to the Moderator user-account interface and wants to retire
+    # the @moder_sticker_bot identity.
+    bot_enabled = (os.getenv("BOT_ENABLED", "true").strip().lower()
+                   not in ("0", "false", "no", "off"))
+    if not bot_enabled:
+        log.info("BOT_ENABLED=false → running userbot-only mode")
+        return _run_userbot_only(bot_cfg, model_cfg)
+
     app = build_app(bot_cfg, model_cfg)
     log.info(
         "review bot starting; source=@%s; owner=%s; allowlist_seed=%s; allowlist_path=%s",
