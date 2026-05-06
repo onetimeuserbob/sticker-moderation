@@ -997,20 +997,19 @@ class ReviewBot:
 
         if not pack_url:
             problems.append(
-                "⚠️ *No pack link in this batch.* I'll review the marketing "
+                "⚠️ No pack link in this batch. I'll review the marketing "
                 "photos only — but I can't open the actual sticker pack to "
-                "check its contents. If you forwarded from @sticker\\_bot, "
-                "please also forward the *text message with the link* "
+                "check its contents. If you forwarded from @sticker_bot, "
+                "please also forward the text message with the link "
                 "(usually the message right after the two photos), or paste "
-                "the `t.me/addstickers/<slug>` link as a reply."
+                "the t.me/addstickers/<slug> link as a reply."
             )
         else:
             slug = slug_from_url(pack_url)
             if not slug:
                 problems.append(
-                    f"⚠️ *Bad pack URL:* `{_md_escape(pack_url)}` — I can't "
-                    "parse a slug from this. Expected format: "
-                    "`t.me/addstickers/<slug>`."
+                    f"⚠️ Bad pack URL: {pack_url} — I can't parse a slug from "
+                    "this. Expected format: t.me/addstickers/<slug>."
                 )
             else:
                 try:
@@ -1025,10 +1024,10 @@ class ReviewBot:
                     log.warning("ingest_pack failed for %s: %s", slug, e)
                     sticker_meta = {"error": str(e)}
                     problems.append(
-                        f"⚠️ *Couldn't open the sticker pack* `{_md_escape(slug)}`: "
-                        f"_{_md_escape(str(e))}_. Pack may be private, "
-                        "deleted, or my bot token doesn't have access. "
-                        "Verdict below treats this as unverifiable (RED)."
+                        f"⚠️ Couldn't open the sticker pack {slug}: {e}. "
+                        "Pack may be private, deleted, or my bot token "
+                        "doesn't have access. Verdict below treats this as "
+                        "unverifiable (RED)."
                     )
 
         title = sticker_meta.get("title") or _first_line(full_text) or "(none)"
@@ -1048,7 +1047,7 @@ class ReviewBot:
         except Exception as e:  # noqa: BLE001
             log.exception("Claude review failed: %s", e)
             problems.append(
-                f"❌ *Claude call failed:* _{_md_escape(str(e))}_. "
+                f"❌ Claude call failed: {e}. "
                 "I couldn't run the review. Try again in a moment."
             )
             verdict = {
@@ -1111,12 +1110,10 @@ class ReviewBot:
             )
             sent_msg_id = getattr(sent, "id", None)
         else:
-            sent = await _safe_send(
-                self.bot,
+            sent = await self.bot.send_message(
                 chat_id=chat_id,
                 text=verdict_text,
                 reply_to_message_id=anchor_message_id,
-                parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
             sent_msg_id = getattr(sent, "message_id", None)
@@ -1205,21 +1202,27 @@ class ReviewBot:
 
     @staticmethod
     def _format_verdict(verdict: dict, sticker_meta: dict, pack_url: str) -> str:
+        """Format a verdict as PLAIN TEXT (no Markdown).
+
+        We send this via the userbot, which sends in plain mode (Telethon's
+        Markdown parser doesn't render legacy single-asterisk bold and
+        chokes on common punctuation). The PTB owner-DM path also gets
+        plain text — consistent rendering everywhere is worth more than
+        bold headers."""
         cat = (verdict.get("risk_category") or "RED").upper()
         if cat == "GREEN":
-            head = "✅ *APPROVE*"
+            head = "✅ APPROVE"
         elif cat == "YELLOW":
-            head = "🟡 *NEEDS REVIEW*"
+            head = "🟡 NEEDS REVIEW"
         else:
-            head = "❌ *REJECT*"
+            head = "❌ REJECT"
 
         score = verdict.get("risk_score")
         score_part = f" — risk {score}/100" if isinstance(score, int) else ""
 
-        # Pack info line: title · sticker count · type · clickable slug.
         info_bits: list[str] = []
         if sticker_meta.get("title"):
-            info_bits.append(f"*{_md_escape(sticker_meta['title'])}*")
+            info_bits.append(str(sticker_meta["title"]))
         count = sticker_meta.get("count")
         if isinstance(count, int) and count > 0:
             info_bits.append(f"{count} sticker{'s' if count != 1 else ''}")
@@ -1229,44 +1232,29 @@ class ReviewBot:
             info_bits.append("animated")
         elif count:
             info_bits.append("static")
-        # Show the slug as a clickable link to the pack so the human can
-        # open it in one tap. Slug often contains underscores → escape.
-        slug = slug_from_url(pack_url) if pack_url else ""
-        if slug:
-            info_bits.append(f"[{_md_escape(slug)}]({pack_url})")
-        elif pack_url:
+        if pack_url:
             info_bits.append(pack_url)
         info_line = "📦 " + " · ".join(info_bits) if info_bits else ""
 
-        # Claude's reasoning + concerns are freeform text and routinely
-        # contain *, _, `, [, ] which trip Telegram's Markdown parser
-        # ("Can't parse entities" -> the message gets rejected entirely).
-        # Escape them defensively before interpolating.
-        reason = _md_escape((verdict.get("reasoning") or "").strip())
-        if not reason:
-            reason = "(no reason supplied)"
+        reason = (verdict.get("reasoning") or "").strip() or "(no reason supplied)"
 
         concerns: list[str] = []
         for k in ("ip_concerns", "nsfw_concerns", "pii_concerns", "scam_concerns"):
             for c in verdict.get(k) or []:
-                concerns.append(_md_escape(str(c)))
-        concern_line = ""
-        if concerns:
-            concern_line = "\n_Flags:_ " + ", ".join(concerns[:6])
+                concerns.append(str(c))
+        concern_line = "Flags: " + ", ".join(concerns[:6]) if concerns else ""
 
-        # Errors that didn't escalate to a hard reject (e.g. a partial
-        # Claude batch failure) — surface them so the human knows.
         err = verdict.get("error")
-        err_line = f"\n_Notes:_ {_md_escape(str(err))}" if err else ""
+        err_line = f"Notes: {err}" if err else ""
 
         parts = [f"{head}{score_part}"]
         if info_line:
             parts.append(info_line)
         parts.append(reason)
         if concern_line:
-            parts.append(concern_line.lstrip("\n"))
+            parts.append(concern_line)
         if err_line:
-            parts.append(err_line.lstrip("\n"))
+            parts.append(err_line)
         return "\n".join(parts)
 
     # ---------- /addrule ingestion via Claude ----------
@@ -1356,7 +1344,7 @@ class ReviewBot:
         if decision == "noop":
             return (
                 "👌 Got it — recorded your view. "
-                f"I won't change the ruleset because: _{reason}_"
+                f"I won't change the ruleset because: {reason}"
             )
 
         text = (result.get("text") or "").strip()
@@ -1367,19 +1355,18 @@ class ReviewBot:
             updated = self.rules.update(existing_id, text=text, category=category)
             if updated:
                 return (
-                    f"♻️ Learned: amended amendment `#{updated.id}` ({updated.category}).\n"
-                    f"{updated.text}\n\n_{reason}_"
+                    f"♻️ Learned: amended rule #{updated.id} ({updated.category}).\n"
+                    f"{updated.text}\n\n{reason}"
                 )
         if decision == "remove" and result.get("amend_id"):
             existing_id = int(result["amend_id"])
             removed = self.rules.deactivate(existing_id)
             if removed:
                 return (
-                    f"🗑 Learned: deactivated amendment `#{removed.id}` ({removed.category}): {removed.text}\n"
-                    f"_{reason}_"
+                    f"🗑 Learned: deactivated rule #{removed.id} ({removed.category}): {removed.text}\n"
+                    f"{reason}"
                 )
 
-        # default: add
         amendment = self.rules.add(
             text=text,
             category=category,
@@ -1387,8 +1374,8 @@ class ReviewBot:
             context=record.get("pack_url", "")[:200],
         )
         return (
-            f"✅ Learned: added amendment `#{amendment.id}` ({amendment.category}).\n"
-            f"{amendment.text}\n\n_{reason}_"
+            f"✅ Learned: added rule #{amendment.id} ({amendment.category}).\n"
+            f"{amendment.text}\n\n{reason}"
         )
 
     # ---------- Claude helpers (rule synthesis / learning) ----------

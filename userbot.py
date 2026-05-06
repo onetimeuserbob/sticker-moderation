@@ -161,28 +161,31 @@ class UserbotRelay:
         *,
         reply_to: int | None = None,
     ):
-        """Markdown send with plain-text fallback (mirrors _safe_send for PTB).
-        If Telethon's md parser rejects the text we strip Markdown and retry."""
+        """Send as PLAIN TEXT — no Markdown parsing.
+
+        Telethon's `md` parser is MarkdownV2-style (needs ``**bold**``,
+        escaped ``-``/``.``/``!``, etc.). Most of our text — Claude's
+        freeform reasoning, the rules summary, assistant replies — is
+        written in legacy single-asterisk style and contains punctuation
+        that V2 chokes on. Trying to parse it produced two failure modes
+        for the user: literal ``*`` everywhere (parser silently dropped
+        the message and we delivered the unparsed source) or stray ``\\_``
+        in usernames like ``@sticker_bot``.
+
+        The fix is the simplest one: send plain text. We strip any
+        leftover Markdown escape characters defensively so we don't
+        deliver ``\\_`` either.
+        """
         from review_bot import _strip_markdown
-        try:
-            sent = await self.send_message(
-                chat_id, text, reply_to=reply_to, markdown=True
-            )
-            log.info(
-                "userbot sent: chat=%s reply_to=%s msg_id=%s bytes=%d",
-                chat_id, reply_to, getattr(sent, "id", None), len(text),
-            )
-            return sent
-        except (RPCError, ValueError) as e:
-            log.warning("telethon md send failed (%s); falling back to plain", e)
-            sent = await self.send_message(
-                chat_id, _strip_markdown(text), reply_to=reply_to, markdown=False
-            )
-            log.info(
-                "userbot sent (plain fallback): chat=%s reply_to=%s msg_id=%s",
-                chat_id, reply_to, getattr(sent, "id", None),
-            )
-            return sent
+        plain = _strip_markdown(text)
+        sent = await self.send_message(
+            chat_id, plain, reply_to=reply_to, markdown=False
+        )
+        log.info(
+            "userbot sent: chat=%s reply_to=%s msg_id=%s bytes=%d",
+            chat_id, reply_to, getattr(sent, "id", None), len(plain),
+        )
+        return sent
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         if self.client is None:
@@ -237,8 +240,8 @@ class UserbotRelay:
                         "👋 Hi — I'm Moderator. I'll review sticker-pack "
                         "applications posted here and answer questions about "
                         "the moderation rules. Reply to me or @-mention me "
-                        "and I'll respond. Type something like _what are the "
-                        "rules?_ to get started."
+                        "and I'll respond. Type something like \"what are "
+                        "the rules?\" to get started."
                     ),
                 )
             except Exception:  # noqa: BLE001
@@ -503,7 +506,7 @@ class UserbotRelay:
             try:
                 await self.send_message_safe(
                     chat_id,
-                    f"❌ I crashed while reviewing this batch: `{e}`. "
+                    f"❌ I crashed while reviewing this batch: {e}. "
                     "Please re-send and ping me if it keeps happening.",
                     reply_to=anchor.id,
                 )

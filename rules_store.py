@@ -174,18 +174,18 @@ class RulesStore:
     # ---------- /rules summary for chat display ----------
 
     def rules_summary(self, source_bot: str = "sticker_bot") -> str:
-        """Concise human summary for the /rules command."""
-        # Escape underscores so usernames like @sticker_bot don't render
-        # as italics under Telegram's legacy Markdown parser.
-        safe_source = (source_bot or "").replace("_", r"\_")
+        """Concise human summary of the moderation policy. Plain text — no
+        Markdown — so it always renders identically across Telegram clients
+        and Telethon's parser can't choke on it."""
         base = (
-            "*Sticker Pad — moderation policy (summary)*\n\n"
-            "I review applications posted by @"
-            + safe_source
-            + " and suggest ✅ APPROVE or ❌ REJECT with a one-line reason. "
-            "Default is GREEN — I only carve out high-risk cases.\n\n"
-            "*🔴 RED (auto-reject)*\n"
-            "• Marketplace impersonation — pack logo/cover dominated by Sticker Pad / Stickerdom branding, "
+            "Sticker Pad — moderation policy (summary)\n"
+            "\n"
+            f"I review applications posted by @{source_bot} and suggest "
+            "✅ APPROVE or ❌ REJECT with a one-line reason. Default is "
+            "GREEN — I only carve out high-risk cases.\n"
+            "\n"
+            "🔴 RED (auto-reject)\n"
+            "• Marketplace impersonation — pack logo/cover dominated by Sticker Pad branding, "
             "or a fake \"Tonkeeper / Binance Official\" pack.\n"
             "• Default Telegram or VK packs reused 1:1 (Great Minds, Animated Emojies, etc.).\n"
             "• NFT-collection mass derivatives without a specific token# (BAYC, Pudgy, CryptoPunks, Doodles, Azuki, etc.).\n"
@@ -195,13 +195,15 @@ class RulesStore:
             "• Hard NSFW: explicit visible genitalia/sex acts, ANY sexualization of minors, real-photo gore.\n"
             "• PII / impersonation / doxing of private individuals; sexual deepfakes of public figures.\n"
             "• Pack core identity is a literal scam claim or fake giveaway/airdrop.\n"
-            "• Pack inaccessible via Telegram, or sticker count out of range (min 4, max 30).\n\n"
-            "*🟡 YELLOW (human review)*\n"
+            "• Pack inaccessible via Telegram, or sticker count out of range (min 4, max 30).\n"
+            "\n"
+            "🟡 YELLOW (human review)\n"
             "• Specific named-character riff that might be transformative.\n"
             "• Real public figure used semi-realistically and non-satirically.\n"
             "• 1–2 borderline stickers in an otherwise clean set.\n"
-            "• NFT pack claiming a specific token# — needs ownership check.\n\n"
-            "*🟢 GREEN (auto-publish, the default)*\n"
+            "• NFT pack claiming a specific token# — needs ownership check.\n"
+            "\n"
+            "🟢 GREEN (auto-publish, the default)\n"
             "• Pepe / Wojak / Doge / Cheems / classic memes.\n"
             "• Crypto-native culture (gm, wagmi, hodl, TON / Notcoin themes, MAKE TON GREAT AGAIN).\n"
             "• Caricatures / parody of public figures (Trump, Musk, Durov) without hardcore humiliation.\n"
@@ -212,23 +214,16 @@ class RulesStore:
             "• Edgy / vulgar text (any language) that isn't hate-speech, doxing, or terror calls."
         )
         amendments = self.active()
-        if amendments:
-            lines = ["\n\n*🛠 Operator amendments*"]
-            for a in amendments:
-                tag = {"RED": "🔴", "YELLOW": "🟡", "GREEN": "🟢", "NOTE": "🛈"}.get(a.category, "🛈")
-                src = "added" if a.source == "addrule" else "learned"
-                lines.append(f"`#{a.id}` {tag} *{a.category}* ({src}) — {a.text}")
-            return base + "\n".join(lines) + (
-                "\n\nIf you disagree with a suggestion, *reply to my verdict* with the correct decision and a "
-                "one-line reason — I'll consider amending the rules.\n"
-                "Use `/addrule <text>` to add a rule directly, `/delrule <id>` to remove an amendment."
-            )
-        return base + (
-            "\n\n_No operator amendments yet._\n\n"
-            "If you disagree with a suggestion, *reply to my verdict* with the correct decision and a "
-            "one-line reason — I'll consider amending the rules.\n"
-            "Use `/addrule <text>` to add a rule directly, `/delrule <id>` to remove an amendment."
+        footer = (
+            "\n\nIf you disagree with a verdict, reply to my message with the correct "
+            "decision and a one-line reason — I'll consider amending the rules."
         )
+        if amendments:
+            lines = ["\n\nRules from replies:"]
+            for a in amendments:
+                lines.append(f"• {a.text}")
+            return base + "\n".join(lines) + footer
+        return base + "\n\nNo extra rules from replies yet." + footer
 
 
 # ---------- module-level singleton convenience ----------
