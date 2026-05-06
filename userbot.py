@@ -286,32 +286,71 @@ class UserbotRelay:
                 log.info("replay: chat=%s — no app-shaped source-bot messages in window", chat_id)
                 continue
 
-            # Group by grouped_id (None grouped_id = standalone). For
-            # each group, anchor = min(id). Skip groups whose anchor is
-            # already in verdict_index.
-            groups: dict[object, list] = {}
-            for m in candidates:
-                key = m.grouped_id if m.grouped_id else f"solo-{m.id}"
-                groups.setdefault(key, []).append(m)
+            # Group into applications. @sticker_bot posts one application as:
+            #   * a media group (logo + cover, sharing grouped_id), then
+            #   * a standalone text message with the pack link (no grouped_id).
+            # Walk OLDEST→NEWEST and bucket consecutive items together:
+            # any contiguous run that shares a grouped_id stays together;
+            # a following text-only message (no grouped_id) within the
+            # same minute attaches to the previous media-group bucket.
+            # Standalone link messages with no preceding media group form
+            # their own bucket.
+            ATTACH_GAP_S = 30
+            ordered = sorted(candidates, key=lambda m: m.id)
+            buckets: list[list] = []
+            for m in ordered:
+                attach_to_prev = False
+                if buckets:
+                    prev = buckets[-1]
+                    prev_grouped = prev[0].grouped_id
+                    # Same-media-group continuation: append.
+                    if m.grouped_id is not None and m.grouped_id == prev_grouped:
+                        attach_to_prev = True
+                    # Trailing text message that belongs to the
+                    # previous media group: append, but only once per
+                    # bucket (once a text trailer is in, the bucket is
+                    # complete) and only if posted within ATTACH_GAP_S.
+                    elif (
+                        m.grouped_id is None
+                        and prev_grouped is not None
+                        and not any(x.grouped_id is None for x in prev)
+                        and abs((m.date - prev[-1].date).total_seconds()) <= ATTACH_GAP_S
+                    ):
+                        attach_to_prev = True
+                if attach_to_prev:
+                    buckets[-1].append(m)
+                else:
+                    buckets.append([m])
 
             replayed = 0
-            for key, msgs in groups.items():
+            skipped = 0
+            for msgs in buckets:
                 anchor_id = min(m.id for m in msgs)
                 if (chat_id, anchor_id) in already:
+                    skipped += 1
                     continue
                 log.info(
-                    "replay: re-injecting missed batch chat=%s anchor=%s parts=%d",
+                    "replay: processing missed batch chat=%s anchor=%s parts=%d",
                     chat_id, anchor_id, len(msgs),
                 )
-                # Feed oldest-first into the debouncer; buffer will
-                # combine them (3 s debounce) and _fire will run.
-                for m in sorted(msgs, key=lambda x: x.id):
-                    await self._buffer(chat_id, m)
+                # Process atomically — DO NOT route through _buffer, as
+                # the debouncer's per-chat coalescing would fuse all
+                # missed applications into one giant batch with one
+                # wrong-anchor verdict (which is exactly the bug this
+                # method was rewritten to fix).
+                try:
+                    await self._process_app_batch(chat_id, msgs)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("replay batch failed (anchor=%s): %s",
+                                  anchor_id, e)
                 replayed += 1
+                # Small breather so we don't burst Anthropic / Telegram
+                # rate limits when there are many missed apps to catch up on.
+                await asyncio.sleep(1.0)
 
             log.info(
-                "replay: chat=%s — %d candidate batch(es), %d replayed, %d already done",
-                chat_id, len(groups), replayed, len(groups) - replayed,
+                "replay: chat=%s — %d batch(es) total, %d processed, %d already done",
+                chat_id, len(buckets), replayed, skipped,
             )
 
     # ---------- Outgoing primitives (used by ReviewBot.run_review) ----------
@@ -723,10 +762,24 @@ class UserbotRelay:
         buf = self.buffers.pop(chat_id, None)
         if not buf or not buf.messages:
             return
-        msgs = sorted(buf.messages, key=lambda m: m.id)
+        await self._process_app_batch(chat_id, buf.messages)
+
+    async def _process_app_batch(self, chat_id: int, raw_msgs: list) -> None:
+        """Run one application through the review pipeline.
+
+        Caller is responsible for ensuring ``raw_msgs`` is exactly the
+        message-set of a SINGLE application — typically a media group
+        plus the trailing text message with the pack link, or a single
+        standalone link message. Live traffic gets here via the buffered
+        ``_fire`` (3 s debounce); the startup replay gets here directly,
+        per-grouped_id, so two separate applications never get fused
+        into one verdict.
+        """
+        if not raw_msgs:
+            return
+        msgs = sorted(raw_msgs, key=lambda m: m.id)
         anchor = msgs[0]
 
-        # Merge text from all parts; pull pack url from any of them.
         full_text = "\n".join((m.message or "") for m in msgs).strip()
         pack_url = ""
         for m in msgs:
@@ -738,7 +791,6 @@ class UserbotRelay:
             if m:
                 pack_url = m.group(0)
 
-        # Download photos.
         photo_paths = await self._download_photos(msgs, chat_id)
 
         log.info(
