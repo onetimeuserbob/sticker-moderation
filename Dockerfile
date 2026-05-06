@@ -20,14 +20,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY moderate_packs.py tg_ingest.py review_bot.py rules_store.py ./
+COPY moderate_packs.py tg_ingest.py review_bot.py rules_store.py userbot.py ./
 COPY build_review.py ./
 
 # Persisted state lives here (fly volume mount target).
+# Includes the Telethon session file (auth secret — DO NOT bake into the image).
 RUN mkdir -p /data
 ENV RULES_STORE_PATH=/data/rules_store.json \
     ALLOWLIST_PATH=/data/allowed_chats.json \
     TG_CACHE_DIR=/data/tg_cache \
+    USERBOT_SESSION_PATH=/data/userbot.session \
     PORT=8080
 
 EXPOSE 8080

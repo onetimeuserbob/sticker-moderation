@@ -15,6 +15,8 @@ __pycache__
 .rules_store.json
 .allowed_chats.json
 .tg_cache/
+*.session
+*.session-journal
 
 # pipeline working artifacts (large, never needed at runtime)
 .pack_cache*.jsonl

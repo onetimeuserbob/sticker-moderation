@@ -83,6 +83,17 @@ class BotConfig:
     owner_user_id: int
     seed_allowed_chat_ids: set[int]
     allowlist_path: Path
+    # Telethon userbot relay (lets us see messages from other bots, which
+    # the Bot API blocks). Optional — if api_id/api_hash/session not all
+    # set, the relay is disabled and the bot runs in PTB-only mode.
+    userbot_api_id: int = 0
+    userbot_api_hash: str = ""
+    userbot_session_path: Path = field(
+        default_factory=lambda: Path(os.getenv("USERBOT_SESSION_PATH", "userbot.session"))
+    )
+    # Source-bot user ids the userbot will treat as application-posters.
+    # Default to @sticker_bot (id 7686366470). Comma-separated env var.
+    source_bot_ids: set[int] = field(default_factory=set)
     media_group_debounce_s: float = 2.0
     tg_cache_dir: Path = field(
         default_factory=lambda: Path(os.getenv("TG_CACHE_DIR", ".tg_cache"))
@@ -105,6 +116,12 @@ class BotConfig:
             owner_id = int(owner_raw)
         except ValueError as e:
             raise SystemExit(f"OWNER_USER_ID must be an integer, got {owner_raw!r}") from e
+        userbot_api_id_raw = (os.getenv("TELEGRAM_API_ID", "") or "").strip()
+        userbot_api_id = int(userbot_api_id_raw) if userbot_api_id_raw.isdigit() else 0
+        source_bot_ids_raw = (os.getenv("SOURCE_BOT_IDS", "7686366470") or "").strip()
+        source_bot_ids = {
+            int(x) for x in source_bot_ids_raw.split(",") if x.strip().isdigit()
+        }
         return cls(
             review_token=review_token,
             pipeline_token=pipeline_token,
@@ -114,6 +131,12 @@ class BotConfig:
                 int(x) for x in (os.getenv("ALLOWED_CHAT_IDS", "") or "").split(",") if x.strip()
             },
             allowlist_path=Path(os.getenv("ALLOWLIST_PATH", ".allowed_chats.json")),
+            userbot_api_id=userbot_api_id,
+            userbot_api_hash=(os.getenv("TELEGRAM_API_HASH", "") or "").strip(),
+            userbot_session_path=Path(
+                os.getenv("USERBOT_SESSION_PATH", "userbot.session")
+            ),
+            source_bot_ids=source_bot_ids,
         )
 
 
@@ -336,6 +359,11 @@ class ReviewBot:
         self.bot_cfg = bot_cfg
         self.model_cfg = model_cfg
         self.rules = get_default_store()
+        # PTB Bot instance, populated in post_init so external transports
+        # (userbot relay) can use it to send replies into chats they observed.
+        self.bot = None  # type: ignore[assignment]
+        # Userbot relay (optional). Populated in post_init if env is set.
+        self.userbot = None  # type: ignore[assignment]
 
         if not model_cfg.anthropic_key:
             raise SystemExit("ANTHROPIC_API_KEY not set in .env")
@@ -854,50 +882,65 @@ class ReviewBot:
         ctx: ContextTypes.DEFAULT_TYPE,
         msgs: list[Message],
     ) -> None:
-        anchor = msgs[0]  # reply target
-        chat_id = anchor.chat_id
-
-        # Aggregate text and pack URL across all messages in the group.
+        """PTB-side adapter: download photos via PTB, then call run_review."""
+        anchor = msgs[0]
         full_text = "\n".join(message_text_or_caption(m) for m in msgs).strip()
-        # Some messages put the URL only in entities (text_link / url) rather
-        # than the visible text. Sweep entities/caption_entities of every
-        # buffered message so we don't miss a button-style link.
         pack_url = find_pack_url(full_text) or _find_pack_url_in_entities(msgs) or ""
+        local_marketing = await self._download_message_photos(ctx, msgs)
+        await self.run_review(
+            chat_id=anchor.chat_id,
+            anchor_message_id=anchor.message_id,
+            photo_paths=local_marketing,
+            full_text=full_text,
+            pack_url=pack_url,
+            source="ptb",
+        )
+
+    async def run_review(
+        self,
+        *,
+        chat_id: int,
+        anchor_message_id: int,
+        photo_paths: list[Path],
+        full_text: str,
+        pack_url: str,
+        source: str = "ptb",
+    ) -> None:
+        """Transport-agnostic review core. Used by both the PTB message
+        handler and the Telethon userbot relay. Sends all chat output via
+        self.bot (the moderator bot's identity), regardless of which
+        transport observed the application."""
+        if self.bot is None:
+            log.error("run_review called before bot was initialized")
+            return
 
         log.info(
-            "review: msgs=%d photos=%d text_len=%d pack_url=%r",
-            len(msgs),
-            sum(1 for m in msgs if m.photo),
-            len(full_text),
-            pack_url,
+            "review[%s]: chat=%s anchor=%s photos=%d text_len=%d pack_url=%r",
+            source, chat_id, anchor_message_id,
+            len(photo_paths), len(full_text or ""), pack_url,
         )
         if not pack_url and full_text:
             log.info("review: no pack URL parsed; text head=%r", full_text[:300])
 
-        # Post a placeholder so the user knows we're working. We'll
-        # delete it right before posting the real verdict. do_quote=True
-        # makes Telegram show the visible "↳ replying to" indicator even
-        # in private chats, so it's obvious which application this is for.
-        checking_msg: Message | None = None
+        # "Checking…" placeholder, replied to the application's anchor.
+        checking_msg_id: int | None = None
         try:
-            checking_msg = await anchor.reply_text(
-                "🔍 Checking application…",
+            sent = await self.bot.send_message(
+                chat_id=chat_id,
+                text="🔍 Checking application…",
+                reply_to_message_id=anchor_message_id,
+                allow_sending_without_reply=True,
                 disable_notification=True,
-                do_quote=True,
             )
+            checking_msg_id = sent.message_id
         except Exception as e:  # noqa: BLE001
             log.warning("could not send 'Checking…' placeholder: %s", e)
         try:
-            await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+            await self.bot.send_chat_action(chat_id=chat_id, action="typing")
         except Exception:  # noqa: BLE001
             pass
 
-        # Download the in-message photos to use as the marketing images.
-        local_marketing = await self._download_message_photos(ctx, msgs)
-
-        # If the message contains a pack URL, also pull individual sticker
-        # thumbnails via the pipeline bot's token. This is what the offline
-        # pipeline does and what the prompt is calibrated against.
+        # Pull the actual sticker thumbnails so Claude judges the real pack.
         sticker_paths: list[Path] = []
         sticker_meta: dict = {}
         if pack_url:
@@ -919,22 +962,17 @@ class ReviewBot:
         description = full_text
         sticker_count = sticker_meta.get("count", 0)
 
-        # Compose the prompt with operator amendments appended.
         amendments_block = self.rules.amendments_block()
-        # We need to call Claude with the prompt but including the amendments.
-        # _claude_one_call uses CLAUDE_PROMPT directly — patch it via a
-        # lightweight wrapper that monkey-substitutes the prompt for this
-        # call only.
         verdict = await asyncio.to_thread(
             self._claude_review_with_amendments,
             title,
             description,
-            local_marketing,
+            photo_paths,
             sticker_paths,
             amendments_block,
         )
 
-        # Sticker-count hard rules (mirror the pipeline).
+        # Sticker-count / unverifiable hard rules (mirror the offline pipeline).
         if pack_url and sticker_meta.get("error"):
             verdict = {
                 "risk_category": "RED",
@@ -964,36 +1002,36 @@ class ReviewBot:
             }
 
         verdict_text = self._format_verdict(verdict, sticker_meta, pack_url)
-        # Delete the "Checking…" placeholder before posting the verdict so
-        # the chat has just one final message per application.
-        if checking_msg is not None:
+
+        if checking_msg_id is not None:
             try:
-                await checking_msg.delete()
+                await self.bot.delete_message(chat_id=chat_id, message_id=checking_msg_id)
             except Exception as e:  # noqa: BLE001
                 log.warning("could not delete 'Checking…' placeholder: %s", e)
-        sent = await _safe_reply(
-            anchor,
-            verdict_text,
+
+        sent = await _safe_send(
+            self.bot,
+            chat_id=chat_id,
+            text=verdict_text,
+            reply_to_message_id=anchor_message_id,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
-            do_quote=True,
         )
 
         self.reviews_served += 1
-        # Index this verdict so a reply can be recognized as a correction.
-        self.verdict_index[sent.message_id] = {
-            "original_message_id": anchor.message_id,
-            "pack_url": pack_url,
-            "title": title,
-            "description": description,
-            "verdict": verdict,
-            "sticker_meta": sticker_meta,
-            "ts": time.time(),
-        }
-        # Trim the verdict index so it doesn't grow forever.
-        if len(self.verdict_index) > 500:
-            for old_id in sorted(self.verdict_index.keys())[:100]:
-                self.verdict_index.pop(old_id, None)
+        if sent is not None:
+            self.verdict_index[sent.message_id] = {
+                "original_message_id": anchor_message_id,
+                "pack_url": pack_url,
+                "title": title,
+                "description": description,
+                "verdict": verdict,
+                "sticker_meta": sticker_meta,
+                "ts": time.time(),
+            }
+            if len(self.verdict_index) > 500:
+                for old_id in sorted(self.verdict_index.keys())[:100]:
+                    self.verdict_index.pop(old_id, None)
 
     # ---------- Claude wrapper that injects amendments ----------
 
@@ -1433,6 +1471,26 @@ def _strip_markdown(s: str) -> str:
     return out
 
 
+async def _safe_send(
+    bot,
+    *,
+    chat_id: int,
+    text: str,
+    **kwargs,
+) -> "Message | None":
+    """Like _safe_reply but for raw Bot.send_message calls (no Message
+    object available — used by the userbot relay path and by run_review)."""
+    from telegram.error import BadRequest
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except BadRequest as e:
+        if "parse entities" not in str(e).lower():
+            raise
+        log.warning("markdown parse failed, falling back to plain text: %s", e)
+        kwargs.pop("parse_mode", None)
+        return await bot.send_message(chat_id=chat_id, text=_strip_markdown(text), **kwargs)
+
+
 async def _safe_reply(
     msg: "Message",
     text: str,
@@ -1488,7 +1546,50 @@ def _chunk(s: str, n: int) -> list[str]:
 
 def build_app(bot_cfg: BotConfig, model_cfg: Config) -> Application:
     bot = ReviewBot(bot_cfg, model_cfg)
-    app = ApplicationBuilder().token(bot_cfg.review_token).build()
+
+    async def _post_init(application: Application) -> None:
+        bot.bot = application.bot
+        # Start the userbot relay if Telethon credentials are configured
+        # AND the session file exists. If not configured, we still run in
+        # PTB-only mode (DMs + forwarded messages still work).
+        if (
+            bot_cfg.userbot_api_id
+            and bot_cfg.userbot_api_hash
+            and bot_cfg.userbot_session_path.exists()
+        ):
+            try:
+                from userbot import UserbotRelay
+                bot.userbot = UserbotRelay(bot, bot_cfg)
+                await bot.userbot.start()
+                log.info(
+                    "userbot relay started; session=%s; source_bot_ids=%s",
+                    bot_cfg.userbot_session_path,
+                    sorted(bot_cfg.source_bot_ids) or "(none)",
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception("userbot relay failed to start: %s", e)
+        else:
+            log.info(
+                "userbot relay disabled (api_id=%s, api_hash=%s, session_exists=%s)",
+                bool(bot_cfg.userbot_api_id),
+                bool(bot_cfg.userbot_api_hash),
+                bot_cfg.userbot_session_path.exists(),
+            )
+
+    async def _post_shutdown(application: Application) -> None:
+        if bot.userbot is not None:
+            try:
+                await bot.userbot.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    app = (
+        ApplicationBuilder()
+        .token(bot_cfg.review_token)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler(["start", "help"], bot.cmd_start))
     app.add_handler(CommandHandler("rules", bot.cmd_rules))

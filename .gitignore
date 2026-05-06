@@ -8,6 +8,10 @@
 .allowed_chats.json
 .tg_cache/
 
+# Telethon userbot session — contains your account auth token.
+*.session
+*.session-journal
+
 # Pipeline working artifacts (large, may contain real pack data)
 .pack_cache*.jsonl
 .dryrun_cache.jsonl
