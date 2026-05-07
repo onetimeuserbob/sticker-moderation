@@ -1660,13 +1660,21 @@ def _md_escape(s: str) -> str:
 
 
 def _strip_markdown(s: str) -> str:
-    """Best-effort Markdown -> plain text for fallback delivery."""
+    """Best-effort Markdown -> plain text for fallback delivery.
+
+    The italic and bold patterns require non-word-character boundaries
+    on both sides so we don't mangle word-internal punctuation that
+    *isn't* markdown — most importantly underscores inside URLs and
+    pack slugs (e.g. ``https://t.me/addstickers/Pop_Of_Color``). The
+    previous unbounded ``_(...)_`` rule ate those and produced broken
+    links in every verdict for any pack whose slug contained ``_``.
+    """
     out = (s or "")
-    out = re.sub(r"\\([_\\*`\[\]])", r"\1", out)  # un-escape
-    out = re.sub(r"\*([^*\n]+)\*", r"\1", out)     # *bold*
-    out = re.sub(r"_([^_\n]+)_", r"\1", out)       # _italic_
-    out = re.sub(r"`([^`\n]+)`", r"\1", out)       # `code`
-    out = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", out)  # [t](u) -> t (u)
+    out = re.sub(r"\\([_\\*`\[\]])", r"\1", out)
+    out = re.sub(r"(?<![A-Za-z0-9_])\*([^*\n]+?)\*(?![A-Za-z0-9_])", r"\1", out)
+    out = re.sub(r"(?<![A-Za-z0-9_])_([^_\n]+?)_(?![A-Za-z0-9_])", r"\1", out)
+    out = re.sub(r"`([^`\n]+)`", r"\1", out)
+    out = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", out)
     return out
 
 
